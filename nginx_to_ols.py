@@ -1,27 +1,14 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 """
-nginx_to_ols.py
-
-Single-file nginx -> OpenLiteSpeed migrator.
-
 Key behavior:
-- Parses nginx config files using stdlib only
-- Follows nginx include directives when --nginx points to nginx.conf or /etc/nginx
-- Deduplicates symlinked configs by real file identity (device+inode)
+- Parses nginx config files
 - Generates:
     * patched httpd_config.patched.conf
     * vhosts/<site>/vhconf.conf
     * warnings.json
     * migration_report.txt
 - With --apply, writes to real OLS paths and creates backups first
-
-Not every nginx feature maps 1:1 to OLS.
-The script warns on unsupported or risky items instead of silently converting them.
-
-Default:
-- OLS autoLoadHtaccess = YES
 """
 
 from __future__ import annotations
@@ -39,10 +26,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
-# =========================
-# Constants / markers
-# =========================
-
 GLOBAL_BEGIN_LISTENERS = "# BEGIN NGINX_TO_OLS MANAGED LISTENERS"
 GLOBAL_END_LISTENERS = "# END NGINX_TO_OLS MANAGED LISTENERS"
 
@@ -58,10 +41,6 @@ INNER_END_MAPS = "# END NGINX_TO_OLS MAPS"
 DEFAULT_DOCROOT = "/var/www/html"
 DEFAULT_INDEX_HTML = ["index.html", "index.htm"]
 DEFAULT_INDEX_PHP = ["index.php", "index.html", "index.htm"]
-
-# =========================
-# Data classes
-# =========================
 
 @dataclass
 class WarningItem:
@@ -166,9 +145,6 @@ class ExistingListener:
     port: Optional[int]
     secure: bool
 
-# =========================
-# Utilities
-# =========================
 
 def warn(warnings: List[WarningItem], message: str,
          file: str = "", line: int = 0, site: str = "", level: str = "warn") -> None:
@@ -222,9 +198,6 @@ def strip_comments_for_report(text: str) -> str:
             out.append(line)
     return "\n".join(out)
 
-# =========================
-# Nginx tokenizer / parser
-# =========================
 
 def tokenize_nginx(text: str) -> List[Token]:
     tokens: List[Token] = []
@@ -355,9 +328,6 @@ def walk_nodes(nodes: List[Node]):
         if node.children:
             yield from walk_nodes(node.children)
 
-# =========================
-# Nginx source discovery
-# =========================
 
 def read_text_file(path: Path) -> str:
     try:
@@ -449,9 +419,6 @@ def collect_nginx_sources(root: Path, warnings: List[WarningItem]) -> Dict[Path,
     fallback_discover(root)
     return parsed
 
-# =========================
-# Nginx extraction
-# =========================
 
 LISTEN_FLAGS = {
     "default_server", "ssl", "http2", "http3", "quic", "proxy_protocol",
@@ -640,9 +607,6 @@ def extract_nginx_objects(parsed: Dict[Path, List[Node]], warnings: List[Warning
 
     return servers, upstreams
 
-# =========================
-# Merge servers -> sites
-# =========================
 
 def primary_server_name(srv: NginxServer) -> str:
     for n in srv.server_names:
@@ -786,9 +750,6 @@ def merge_servers_to_sites(servers: List[NginxServer], warnings: List[WarningIte
 
     return sites
 
-# =========================
-# Nginx -> OLS conversion helpers
-# =========================
 
 def normalize_index_files(vals: List[str]) -> List[str]:
     out = []
@@ -1145,9 +1106,6 @@ def render_site_vhconf(site: Site,
     text = "\n".join(parts).rstrip() + "\n"
     return text, php_apps, proxy_apps
 
-# =========================
-# OLS rendering / patching
-# =========================
 
 def render_php_extprocessor(app: PhpApp) -> str:
     return "\n".join([
