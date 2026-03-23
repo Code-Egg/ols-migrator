@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,8 +28,10 @@ DEFAULT_DOCROOT = "/var/www/html"
 DEFAULT_INDEX_HTML = ["index.html", "index.htm"]
 DEFAULT_INDEX_PHP = ["index.php", "index.html", "index.htm"]
 
-DEFAULT_OLS_EXAMPLE_KEY = "/usr/local/lsws/conf/example.key"
-DEFAULT_OLS_EXAMPLE_CERT = "/usr/local/lsws/conf/example.crt"
+# FIXED: secure listener defaults
+DEFAULT_OLS_WEBADMIN_KEY = "/usr/local/lsws/admin/conf/webadmin.key"
+DEFAULT_OLS_WEBADMIN_CERT = "/usr/local/lsws/admin/conf/webadmin.crt"
+
 DEFAULT_OUTPUT_DIR = "ols_migration_conf_preview"
 
 @dataclass
@@ -97,6 +100,8 @@ class NginxServer:
     add_headers: List[str] = field(default_factory=list)
     locations: List[NginxLocation] = field(default_factory=list)
     enable_expires: bool = False
+    # FIXED: track default_server-like server blocks
+    default_server_like: bool = False
 
 @dataclass
 class NginxUpstream:
@@ -529,6 +534,43 @@ def unique_preserve(items: List[str]) -> List[str]:
             out.append(x)
     return out
 
+# FIXED: invalid/default server-name helpers
+def is_invalid_server_name(name: str) -> bool:
+    n = (name or "").strip().lower()
+    return (
+        not n or
+        n in ("_", "localhost", "default_server") or
+        n.startswith("127.") or
+        n == "::1" or
+        n.isdigit()
+    )
+
+def is_wildcard_server_name(name: str) -> bool:
+    return "*" in (name or "")
+
+def first_valid_non_wildcard_name(names: List[str]) -> Optional[str]:
+    for n in names:
+        if not is_invalid_server_name(n) and not is_wildcard_server_name(n):
+            return n
+    return None
+
+def first_valid_name(names: List[str]) -> Optional[str]:
+    non_wild = first_valid_non_wildcard_name(names)
+    if non_wild:
+        return non_wild
+    for n in names:
+        if not is_invalid_server_name(n):
+            return n
+    return None
+
+def filter_listener_domains(names: List[str]) -> List[str]:
+    # Prefer exact non-wildcard valid names; if none exist, fall back to any non-invalid names.
+    exact = [n for n in names if not is_invalid_server_name(n) and not is_wildcard_server_name(n)]
+    if exact:
+        return unique_preserve(exact)
+    broad = [n for n in names if not is_invalid_server_name(n)]
+    return unique_preserve(broad)
+
 def parse_location(node: Node, warnings: List[WarningItem]) -> NginxLocation:
     modifier = ""
     path = "/"
@@ -614,6 +656,8 @@ def parse_server(node: Node, warnings: List[WarningItem]) -> NginxServer:
                 continue
             port, secure = parse_listen(a)
             srv.listen_specs.add((port, secure))
+            if "default_server" in a:
+                srv.default_server_like = True
         elif n == "server_name" and a:
             srv.server_names.extend(a)
         elif n == "root" and a:
@@ -709,13 +753,19 @@ def extract_nginx_objects(parsed: Dict[Path, List[Node]], warnings: List[Warning
 
     return servers, upstreams
 
+# FIXED: invalid/default server name handling
 def primary_server_name(srv: NginxServer) -> str:
-    for n in srv.server_names:
-        if n not in ("_", "default_server") and "*" not in n:
-            return n
-    for n in srv.server_names:
-        if n != "_":
-            return n
+    chosen = first_valid_non_wildcard_name(srv.server_names)
+    if chosen:
+        return chosen
+
+    chosen = first_valid_name(srv.server_names)
+    if chosen:
+        return chosen
+
+    if srv.default_server_like or not srv.server_names or any(is_invalid_server_name(n) for n in srv.server_names):
+        return "default"
+
     stem = Path(srv.file).name
     if stem.endswith(".conf"):
         stem = stem[:-5]
@@ -757,6 +807,7 @@ def merge_servers_to_sites(servers: List[NginxServer], warnings: List[WarningIte
         site.vhost_name = ensure_unique_name(key, used_names)
 
         names_seen: List[str] = []
+        warned_invalid_names: Set[str] = set()
         loc_signatures: Set[Tuple[str, str, str, str, str, str, str, str, str]] = set()
         php_apps_seen: Dict[str, str] = {}
         hdrs: List[str] = []
@@ -772,6 +823,15 @@ def merge_servers_to_sites(servers: List[NginxServer], warnings: List[WarningIte
             for sn in srv.server_names:
                 if sn not in names_seen:
                     names_seen.append(sn)
+                if is_invalid_server_name(sn) and sn not in warned_invalid_names:
+                    warned_invalid_names.add(sn)
+                    warn(
+                        warnings,
+                        f"Invalid/special nginx server_name '{sn}' treated as default-style mapping.",
+                        file=srv.file,
+                        line=srv.line,
+                        site=site.vhost_name
+                    )
 
             site.listen_specs |= srv.listen_specs
 
@@ -1459,8 +1519,9 @@ def render_listener_block(name: str,
     ]
 
     if secure:
-        lines.append(f"  keyFile                 {DEFAULT_OLS_EXAMPLE_KEY}")
-        lines.append(f"  certFile                {DEFAULT_OLS_EXAMPLE_CERT}")
+        # FIXED: use requested webadmin cert/key for secure listener bootstrap
+        lines.append(f"  keyFile                 {DEFAULT_OLS_WEBADMIN_KEY}")
+        lines.append(f"  certFile                {DEFAULT_OLS_WEBADMIN_CERT}")
 
     lines.extend(map_lines)
     lines.append("}")
@@ -1470,19 +1531,13 @@ def append_managed_block(text: str, begin: str, end: str, content: str) -> str:
     block = f"\n{begin}\n{content.rstrip()}\n{end}\n"
     return text.rstrip() + "\n" + block
 
+# FIXED: correct OLS listener map direction and invalid/default domain handling
 def build_listener_map_line(site: Site) -> str:
-    domains = [d for d in site.server_names if d and d != "_"]
+    domains = filter_listener_domains(site.server_names)
     if not domains:
-        return f"map                     localhost {site.vhost_name}"
-
-    primary = domains[0]
-    aliases = [d for d in domains if d != primary]
-
-    rhs = site.vhost_name
-    if aliases:
-        rhs += ", " + ", ".join(aliases)
-
-    return f"map                     {primary} {rhs}"
+        domains = ["default"]
+    rhs = ", ".join(domains)
+    return f"map                     {site.vhost_name} {rhs}"
 
 def patch_httpd_config(orig_httpd: str,
                        sites: List[Site],
@@ -1635,10 +1690,56 @@ def write_preview_output(output_dir: Path,
 
     (output_dir / "migration_report.txt").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
 
+# FIXED: ownership / permission helpers
+def stat_uid_gid(path: Path) -> Tuple[Optional[int], Optional[int]]:
+    try:
+        st = path.stat()
+        return st.st_uid, st.st_gid
+    except Exception:
+        return None, None
+
+def stat_mode(path: Path) -> Optional[int]:
+    try:
+        st = path.stat()
+        return stat.S_IMODE(st.st_mode)
+    except Exception:
+        return None
+
+def detect_owner_group_for_site_dir(site_dir: Path, ols_vhosts_root: Path) -> Tuple[Optional[int], Optional[int]]:
+    for p in (site_dir, ols_vhosts_root, ols_vhosts_root.parent):
+        uid, gid = stat_uid_gid(p)
+        if uid is not None and gid is not None:
+            return uid, gid
+    return None, None
+
+def safe_chown(path: Path,
+               uid: Optional[int],
+               gid: Optional[int],
+               warnings: List[WarningItem],
+               site: str = "") -> None:
+    if uid is None or gid is None:
+        return
+    try:
+        os.chown(str(path), uid, gid)
+    except PermissionError:
+        warn(warnings, f"Could not chown '{path}' (permission denied).", file=str(path), site=site)
+    except Exception as e:
+        warn(warnings, f"Could not chown '{path}': {e}", file=str(path), site=site)
+
+def safe_chmod(path: Path,
+               mode: int,
+               warnings: List[WarningItem],
+               site: str = "") -> None:
+    try:
+        os.chmod(path, mode)
+    except Exception as e:
+        warn(warnings, f"Could not chmod '{path}': {e}", file=str(path), site=site)
+
 def apply_to_real_ols(patched_httpd: str,
                       vhost_texts: Dict[str, str],
                       ols_httpd: Path,
-                      ols_vhosts_root: Path) -> List[str]:
+                      ols_vhosts_root: Path,
+                      warnings: List[WarningItem]) -> List[str]:
     actions: List[str] = []
 
     ols_httpd.parent.mkdir(parents=True, exist_ok=True)
@@ -1650,13 +1751,32 @@ def apply_to_real_ols(patched_httpd: str,
 
     for site_name, text in vhost_texts.items():
         site_dir = ols_vhosts_root / site_name
-        site_dir.mkdir(parents=True, exist_ok=True)
-        (site_dir / "logs").mkdir(parents=True, exist_ok=True)
+        logs_dir = site_dir / "logs"
         target = site_dir / "vhconf.conf"
+
+        uid, gid = detect_owner_group_for_site_dir(site_dir, ols_vhosts_root)
+
+        site_dir_mode = stat_mode(site_dir) or stat_mode(ols_vhosts_root) or 0o755
+        logs_dir_mode = stat_mode(logs_dir) or site_dir_mode or 0o755
+        target_mode = stat_mode(target) or 0o640
+
+        site_dir.mkdir(parents=True, exist_ok=True)
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_chown(site_dir, uid, gid, warnings, site=site_name)
+        safe_chown(logs_dir, uid, gid, warnings, site=site_name)
+        safe_chmod(site_dir, site_dir_mode, warnings, site=site_name)
+        safe_chmod(logs_dir, logs_dir_mode, warnings, site=site_name)
+
         bak = backup_file(target)
         if bak:
             actions.append(f"Backed up {target} -> {bak}")
+
         target.write_text(text, encoding="utf-8")
+
+        safe_chown(target, uid, gid, warnings, site=site_name)
+        safe_chmod(target, target_mode, warnings, site=site_name)
+
         actions.append(f"Wrote {target}")
 
     return actions
@@ -1766,6 +1886,7 @@ def main() -> int:
             vhost_texts=vhost_texts,
             ols_httpd=ols_httpd,
             ols_vhosts_root=ols_vhosts_root,
+            warnings=warnings,
         )
         print("")
         print("Applied changes:")
