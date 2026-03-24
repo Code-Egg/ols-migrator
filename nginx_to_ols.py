@@ -2292,6 +2292,34 @@ def reinstall_and_restart_ols():
 
     TERM.ok("OpenLiteSpeed reinstall/reset/restart completed")
 
+def restart_lsws_if_active() -> bool:
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        res = subprocess.run(
+            ["systemctl", "is-active", "lsws"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except Exception:
+        return False
+
+    if res.returncode != 0 or res.stdout.strip().lower() != "active":
+        return False
+
+    def run_cmd(cmd: List[str]):
+        if TERM.verbose:
+            subprocess.run(cmd, check=True)
+        else:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+    TERM.info_kv("Restarting", "lsws")
+    run_cmd(["systemctl", "restart", "lsws"])
+    TERM.ok("lsws restarted")
+    return True
+
 # ============================================================
 # Report / output
 # ============================================================
@@ -2363,6 +2391,7 @@ def print_final_summary(
     nginx_group: Optional[str] = None,
     nginx_user_source: Optional[str] = None,
     used_nginx_user_group: bool = False,
+    restarted_ols: bool = False,
     duration_sec: float = 0.0,
 ):
     if TERM.quiet:
@@ -2391,7 +2420,7 @@ def print_final_summary(
     if applied:
         TERM.kv("Applied OLS config", str(ols_httpd), "green")
         TERM.kv("Applied vhosts", str(ols_vhosts_root), "green")
-        if not used_nginx_user_group:
+        if not used_nginx_user_group and not restarted_ols:
             TERM.note("Restart/reload OLS manually to apply config changes.")
     else:
         TERM.note("Preview only. Nothing has been written to live OLS paths.")
@@ -2594,6 +2623,7 @@ def main():
     TERM.ok("Preview generated successfully")
 
     if args.apply:
+        restarted_ols = False
         if args.use_nginx_user_group:
             if not confirm_use_nginx_user_group(args):
                 TERM.error("User cancelled.")
@@ -2610,8 +2640,11 @@ def main():
 
         if args.use_nginx_user_group and nginx_user and nginx_group:
             reinstall_and_restart_ols()
+            restarted_ols = True
         else:
             TERM.ok("Live OLS config applied")
+            if restart_lsws_if_active():
+                restarted_ols = True
 
     duration_total = time.time() - start_ts
 
@@ -2627,6 +2660,7 @@ def main():
         nginx_group=nginx_group,
         nginx_user_source=nginx_user_source,
         used_nginx_user_group=args.use_nginx_user_group,
+        restarted_ols=restarted_ols if args.apply else False,
         duration_sec=duration_total,
     )
 
