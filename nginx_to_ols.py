@@ -2450,22 +2450,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--nginx",
         default=DEFAULT_NGINX,
+        metavar="<path>",
         help=f"nginx file or directory (default: {DEFAULT_NGINX})",
     )
     p.add_argument(
         "--ols-httpd",
         default=DEFAULT_OLS_HTTPD,
+        metavar="<path>",
         help=f"OLS httpd_config.conf path (default: {DEFAULT_OLS_HTTPD})",
     )
     p.add_argument(
         "--ols-vhosts-root",
-        metavar="OLS_VH_ROOT",
+        metavar="<dir>",
         default=DEFAULT_OLS_VHOSTS_ROOT,
         help=f"OLS vhosts root (default: {DEFAULT_OLS_VHOSTS_ROOT})",
     )
     p.add_argument(
         "--output",
         default=DEFAULT_OUTPUT,
+        metavar="<dir>",
         help=f"preview output directory (default: {DEFAULT_OUTPUT})",
     )
     p.add_argument(
@@ -2483,7 +2486,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="extra_include_glob",
         action="append",
         default=[],
-        metavar="EXT_NGINX_CONF",
+        metavar="<path|dir|glob>",
         help="additional <path|dir|glob> to parse as nginx sources",
     )
     p.add_argument(
