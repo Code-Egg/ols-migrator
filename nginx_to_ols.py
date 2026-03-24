@@ -333,6 +333,19 @@ def sanitize_site_name(name: str) -> str:
     n = n.strip(".-")
     return n or "default"
 
+def site_group_name_for_server(srv: NginxServer) -> str:
+    base = sanitize_site_name(srv.primary_host)
+
+    if base != "default":
+        return base
+
+    ports = sorted({l.port for l in srv.listens if l.port})
+    for port in ports:
+        if port not in (80, 443):
+            return f"default-{port}"
+
+    return base
+
 def is_invalid_server_name(name: str) -> bool:
     if not name:
         return True
@@ -1306,9 +1319,9 @@ def location_regex_to_rewrite(loc: NginxLocation) -> List[str]:
 
     for rw in loc.rewrite_directives:
         if len(rw) == 2:
-            replacement = rw[0]
-            flag = rewrite_flag_to_ols(rw[1])
-            rules.append(f"RewriteRule {pattern} {replacement} [{flag}]")
+            src = normalize_regex_for_ols(rw[0])
+            repl = rw[1]
+            rules.append(f"RewriteRule {src} {repl} [L]")
         elif len(rw) >= 3:
             src = normalize_regex_for_ols(rw[0])
             repl = rw[1]
@@ -1519,19 +1532,23 @@ def convert_location(site: Site, loc: NginxLocation, warnings: List[WarningEntry
                 return
 
     if loc.rewrite_directives:
-        pattern = "^" + re.escape(loc.path.rstrip("/")) + "/?$" if loc.path != "/" else "^/$"
+        added = False
         for rw in loc.rewrite_directives:
             if len(rw) == 2:
-                repl = rw[0]
-                flag = rewrite_flag_to_ols(rw[1])
-                site.rewrite_rules.append(f"RewriteRule {pattern} {repl} [{flag}]")
-                return
-            elif len(rw) >= 3:
+                src = normalize_regex_for_ols(rw[0])
+                repl = rw[1]
+                site.rewrite_rules.append(f"RewriteRule {src} {repl} [L]")
+                added = True
+                continue
+            if len(rw) >= 3:
                 src = normalize_regex_for_ols(rw[0])
                 repl = rw[1]
                 flag = rewrite_flag_to_ols(rw[2])
                 site.rewrite_rules.append(f"RewriteRule {src} {repl} [{flag}]")
-                return
+                added = True
+                continue
+        if added:
+            return
 
     if loc.proxy_pass:
         add_warning(
@@ -1557,7 +1574,7 @@ def convert_location(site: Site, loc: NginxLocation, warnings: List[WarningEntry
 def merge_servers_to_sites(servers: List[NginxServer], warnings: List[WarningEntry]) -> List[Site]:
     grouped: Dict[str, List[NginxServer]] = defaultdict(list)
     for srv in servers:
-        grouped[sanitize_site_name(srv.primary_host)].append(srv)
+        grouped[site_group_name_for_server(srv)].append(srv)
 
     sites: List[Site] = []
 
@@ -2003,19 +2020,19 @@ def patch_httpd_config(
         desired_listener_maps[k] = dedupe_preserve(sorted(desired_listener_maps[k]))
 
     listener_blocks = parse_listener_blocks(text)
-    by_key: Dict[Tuple[int, bool], ListenerBlockInfo] = {}
+    existing_listener_keys: Set[Tuple[int, bool]] = set()
     for lb in listener_blocks:
         if lb.port is not None:
-            by_key.setdefault((lb.port, lb.secure), lb)
+            existing_listener_keys.add((lb.port, lb.secure))
 
     replacements = []
     used_existing_keys = set()
 
     for lb in listener_blocks:
+        if lb.port is None:
+            continue
         key = (lb.port, lb.secure)
         if key not in desired_listener_maps:
-            continue
-        if by_key.get(key) != lb:
             continue
 
         old_block = text[lb.start:lb.end + 1]
@@ -2031,7 +2048,7 @@ def patch_httpd_config(
 
     missing_listener_blocks = []
     for key, map_lines in sorted(desired_listener_maps.items()):
-        if key in used_existing_keys or key in by_key:
+        if key in used_existing_keys or key in existing_listener_keys:
             continue
         port, secure = key
         lname = f"nginx_migrated_{'https' if secure else 'http'}_{port}"
