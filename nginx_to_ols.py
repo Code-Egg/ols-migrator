@@ -1673,6 +1673,35 @@ def merge_servers_to_sites(servers: List[NginxServer], warnings: List[WarningEnt
     sites.sort(key=lambda s: (s.name != "default", s.name))
     return sites
 
+def filter_public_sites(sites: List[Site], warnings: List[WarningEntry]) -> List[Site]:
+    public_ports = {80, 443}
+    out: List[Site] = []
+
+    for site in sites:
+        public_listens = [l for l in site.listens if l.port in public_ports]
+        non_public_ports = sorted({l.port for l in site.listens if l.port not in public_ports})
+
+        if not public_listens:
+            if non_public_ports:
+                add_warning(
+                    warnings,
+                    f"Site skipped due to non-public listen ports: {', '.join(str(p) for p in non_public_ports)}",
+                    site=site.name,
+                )
+            continue
+
+        if non_public_ports:
+            add_warning(
+                warnings,
+                f"Non-public listen ports skipped: {', '.join(str(p) for p in non_public_ports)}",
+                site=site.name,
+            )
+
+        site.listens = dedupe_listens(public_listens)
+        out.append(site)
+
+    return out
+
 # ============================================================
 # OLS rendering
 # ============================================================
@@ -2368,6 +2397,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="patch global OLS user/group from nginx and reinstall/restart OLS on --apply",
     )
     p.add_argument(
+        "--only-public-sites",
+        action="store_true",
+        help="only include sites listening on ports 80/443 (skip others)",
+    )
+    p.add_argument(
         "-y", "--yes",
         action="store_true",
         help="assume yes for confirmation prompts",
@@ -2435,6 +2469,10 @@ def main():
     TERM.info_kv("Merging nginx servers into OLS sites")
     sites = merge_servers_to_sites(servers, warnings)
     TERM.debug(f"Generated site names: {', '.join(s.name for s in sites)}")
+
+    if args.only_public_sites:
+        TERM.info_kv("Filtering sites", "ports 80/443 only")
+        sites = filter_public_sites(sites, warnings)
 
     try:
         existing_httpd = slurp(ols_httpd) if ols_httpd.exists() else ""
