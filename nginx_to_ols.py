@@ -2444,7 +2444,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     formatter = lambda prog: argparse.HelpFormatter(prog, max_help_position=38, width=110)
 
     p = argparse.ArgumentParser(
-        description="Single-file nginx -> OpenLiteSpeed migrator",
         formatter_class=formatter,
     )
 
@@ -2485,7 +2484,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="EXT_NGINX_CONF",
-        help="additional file/folder/glob to parse as nginx sources",
+        help="additional <path|dir|glob> to parse as nginx sources",
     )
     p.add_argument(
         "--extra-include-glob",
@@ -2494,14 +2493,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     p.add_argument(
-        "--use-nginx-user-group",
-        action="store_true",
-        help="patch global OLS user/group from nginx and reinstall/restart OLS on --apply",
-    )
-    p.add_argument(
         "--only-public-sites",
         action="store_true",
         help="only include sites listening on ports 80/443 (skip others)",
+    )
+    p.add_argument(
+        "--use-nginx-user-group",
+        action="store_true",
+        help="patch global OLS user/group from nginx and reinstall/restart OLS on --apply",
     )
     p.add_argument(
         "-y", "--yes",
