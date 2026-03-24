@@ -87,7 +87,9 @@ class Terminal:
             "NOTE": "magenta",
             "DEBUG": "gray",
         }.get(tag_upper, "white")
-        print(f"{self.colorize(f'[{tag_upper}]', color, bold=True)} {message}")
+        tag_label = f"[{tag_upper}]"
+        tag_label = f"{tag_label:<7}"
+        print(f"{self.colorize(tag_label, color, bold=True)} {message}")
 
     def info(self, message: str):
         self._status("INFO", message)
@@ -169,6 +171,7 @@ class ListenSpec:
     port: int
     secure: bool = False
     default_server: bool = False
+    family: str = "ipv4"
 
 @dataclass
 class NginxLocation:
@@ -222,6 +225,7 @@ class ContextSpec:
     allow_browse: int = 1
     allow: List[str] = field(default_factory=list)
     deny: List[str] = field(default_factory=list)
+    rewrite_rules: List[str] = field(default_factory=list)
     source: str = ""
     line: int = 0
 
@@ -255,6 +259,7 @@ class ListenerBlockInfo:
     body: str
     port: Optional[int]
     secure: bool
+    family: str
 
 # ============================================================
 # Small helpers
@@ -276,7 +281,7 @@ def dedupe_listens(items: List[ListenSpec]) -> List[ListenSpec]:
     seen = set()
     out = []
     for x in items:
-        key = (x.port, x.secure, x.default_server)
+        key = (x.port, x.secure, x.default_server, x.family)
         if key not in seen:
             seen.add(key)
             out.append(x)
@@ -728,6 +733,7 @@ def parse_listen(args: List[str]) -> ListenSpec:
     port = None
     secure = False
     default_server = False
+    family = "ipv4"
 
     for a in args:
         la = a.lower()
@@ -743,6 +749,9 @@ def parse_listen(args: List[str]) -> ListenSpec:
         if la in ("quic", "http2", "reuseport", "proxy_protocol", "backlog", "fastopen", "so_keepalive", "bind", "deferred", "ipv6only=on", "ipv6only=off"):
             continue
 
+        if "[" in a and "]" in a:
+            family = "ipv6"
+
         if re.fullmatch(r"\d+", a):
             port = int(a)
             continue
@@ -755,7 +764,7 @@ def parse_listen(args: List[str]) -> ListenSpec:
     if port is None:
         port = 80
 
-    return ListenSpec(port=port, secure=secure, default_server=default_server)
+    return ListenSpec(port=port, secure=secure, default_server=default_server, family=family)
 
 def infer_lsphp_app(target: str, upstreams: Dict[str, List[str]]) -> Optional[str]:
     if not target:
@@ -1023,13 +1032,13 @@ def parse_server(node: Node, upstreams: Dict[str, List[str]], warnings: List[War
             continue
 
     if not server.listens:
-        server.listens = [ListenSpec(port=80, secure=False, default_server=False)]
+        server.listens = [ListenSpec(port=80, secure=False, default_server=False, family="ipv4")]
 
     if (server.ssl_cert or server.ssl_key) and any(l.port == 443 for l in server.listens):
         new_listens = []
         for l in server.listens:
             if l.port == 443:
-                new_listens.append(ListenSpec(port=l.port, secure=True, default_server=l.default_server))
+                new_listens.append(ListenSpec(port=l.port, secure=True, default_server=l.default_server, family=l.family))
             else:
                 new_listens.append(l)
         server.listens = new_listens
@@ -1305,7 +1314,7 @@ def rewrite_flag_to_ols(flag: str) -> str:
         return "L"
     return "L"
 
-def location_regex_to_rewrite(loc: NginxLocation) -> List[str]:
+def location_regex_to_rewrite(loc: NginxLocation, context_scoped: bool = False) -> List[str]:
     rules = []
     pattern = normalize_regex_for_ols(loc.path)
 
@@ -1319,9 +1328,18 @@ def location_regex_to_rewrite(loc: NginxLocation) -> List[str]:
 
     for rw in loc.rewrite_directives:
         if len(rw) == 2:
-            src = normalize_regex_for_ols(rw[0])
-            repl = rw[1]
-            rules.append(f"RewriteRule {src} {repl} [L]")
+            flag_guess = rw[1].lower()
+            if flag_guess in ("permanent", "redirect", "last", "break"):
+                repl = rw[0]
+                flag = rewrite_flag_to_ols(flag_guess)
+                if context_scoped:
+                    rules.append(f"RewriteRule ^.*$ {repl} [{flag}]")
+                else:
+                    rules.append(f"RewriteRule {pattern} {repl} [{flag}]")
+            else:
+                src = normalize_regex_for_ols(rw[0])
+                repl = rw[1]
+                rules.append(f"RewriteRule {src} {repl} [L]")
         elif len(rw) >= 3:
             src = normalize_regex_for_ols(rw[0])
             repl = rw[1]
@@ -1465,6 +1483,30 @@ def convert_location(site: Site, loc: NginxLocation, warnings: List[WarningEntry
             )
         )
         return
+
+    if loc.match_type == "regex" and loc.rewrite_directives and not loc.return_args:
+        if not is_safe_regex_for_ols_context(loc.path):
+            add_warning(
+                warnings,
+                f"Regex rewrite location skipped as unsafe/too complex for OLS context: {loc.path}",
+                source=loc.source,
+                line=loc.line,
+                site=site.name,
+            )
+        else:
+            rules = location_regex_to_rewrite(loc, context_scoped=True)
+            if rules:
+                site.contexts.append(
+                    ContextSpec(
+                        uri=nginx_regex_to_exp(loc.path),
+                        location="$DOC_ROOT/$0",
+                        allow_browse=1,
+                        rewrite_rules=rules,
+                        source=loc.source,
+                        line=loc.line,
+                    )
+                )
+                return
 
     if loc.match_type == "regex" and (loc.return_args or loc.rewrite_directives):
         rules = location_regex_to_rewrite(loc)
@@ -1657,7 +1699,7 @@ def merge_servers_to_sites(servers: List[NginxServer], warnings: List[WarningEnt
         cseen = set()
         deduped_contexts = []
         for c in site.contexts:
-            key = (c.uri, c.location, c.allow_browse, tuple(c.allow), tuple(c.deny))
+            key = (c.uri, c.location, c.allow_browse, tuple(c.allow), tuple(c.deny), tuple(c.rewrite_rules))
             if key not in cseen:
                 cseen.add(key)
                 deduped_contexts.append(c)
@@ -1722,7 +1764,7 @@ def render_errorlog(path: str) -> str:
         f"}}\n"
     )
 
-def render_context(ctx: ContextSpec) -> str:
+def render_context(ctx: ContextSpec, auto_htaccess: bool = True) -> str:
     effective_allow_browse = 1 if ctx.allow else ctx.allow_browse
 
     lines = [
@@ -1740,21 +1782,27 @@ def render_context(ctx: ContextSpec) -> str:
             lines.append(f"    deny                  {item}")
         lines.append("  }")
 
+    if ctx.rewrite_rules:
+        lines.extend(render_rewrite_block_lines(ctx.rewrite_rules, auto_htaccess, indent="  "))
+
     lines.append("}")
     return "\n".join(lines) + "\n"
 
-def render_rewrite_block(rules: List[str], auto_htaccess: bool) -> str:
+def render_rewrite_block_lines(rules: List[str], auto_htaccess: bool, indent: str = "") -> List[str]:
     lines = [
-        "rewrite  {",
-        "  enable                  1",
-        f"  autoLoadHtaccess        {0 if not auto_htaccess else 1}",
+        f"{indent}rewrite  {{",
+        f"{indent}  enable                  1",
+        f"{indent}  autoLoadHtaccess        {0 if not auto_htaccess else 1}",
     ]
     if rules:
-        lines.append("  rules                   <<<END_rules")
+        lines.append(f"{indent}  rules                   <<<END_rules")
         lines.extend(rules)
         lines.append("END_rules")
-    lines.append("}")
-    return "\n".join(lines) + "\n"
+    lines.append(f"{indent}}}")
+    return lines
+
+def render_rewrite_block(rules: List[str], auto_htaccess: bool) -> str:
+    return "\n".join(render_rewrite_block_lines(rules, auto_htaccess, indent="")) + "\n"
 
 def render_vhssl(site: Site) -> str:
     if not site.ssl_cert or not site.ssl_key:
@@ -1800,7 +1848,7 @@ def render_site_vhconf(site: Site, auto_htaccess: bool = True) -> str:
         parts.append(render_errorlog(site.error_log))
 
     for c in site.contexts:
-        parts.append(render_context(c))
+        parts.append(render_context(c, auto_htaccess=auto_htaccess))
 
     all_rewrite_rules = site.rewrite_rules + site.front_controller_rules
     parts.append(render_rewrite_block(all_rewrite_rules, auto_htaccess))
@@ -1872,10 +1920,10 @@ def render_virtualhost_block(site: Site, vhosts_root: Path) -> str:
         f"}}\n"
     )
 
-def render_listener_block(name: str, port: int, secure: bool, map_lines: List[str]) -> str:
+def render_listener_block(name: str, port: int, secure: bool, family: str, map_lines: List[str]) -> str:
     lines = [
         f"listener {name} {{",
-        f"  address                 *:{port}",
+        f"  address                 {'[ANY]' if family == 'ipv6' else '*'}:{port}",
         f"  secure                  {1 if secure else 0}",
     ]
     if secure:
@@ -1944,10 +1992,13 @@ def parse_listener_blocks(httpd_text: str) -> List[ListenerBlockInfo]:
 
         port = None
         secure = False
+        family = "ipv4"
 
         m_addr = re.search(r"(?m)^\s*address\s+(\S+)", body)
         if m_addr:
             addr = m_addr.group(1)
+            if "[" in addr and "]" in addr:
+                family = "ipv6"
             m_port = re.search(r":(\d+)$", addr)
             if m_port:
                 port = int(m_port.group(1))
@@ -1967,6 +2018,7 @@ def parse_listener_blocks(httpd_text: str) -> List[ListenerBlockInfo]:
                 body=body,
                 port=port,
                 secure=secure,
+                family=family,
             )
         )
     return blocks
@@ -1996,6 +2048,13 @@ def upsert_global_managed_block(text: str, block_content: str) -> str:
     if text and not text.endswith("\n"):
         text += "\n"
     return text + "\n" + wrapped
+
+def find_global_managed_span(text: str) -> Optional[Tuple[int, int]]:
+    pattern = re.compile(re.escape(GLOBAL_MANAGED_BEGIN) + r".*?" + re.escape(GLOBAL_MANAGED_END), re.S)
+    m = pattern.search(text)
+    if not m:
+        return None
+    return (m.start(), m.end())
 
 def patch_top_level_user_group(httpd_text: str, user: Optional[str], group: Optional[str]) -> str:
     text = httpd_text
@@ -2036,23 +2095,28 @@ def patch_httpd_config(
     if use_nginx_user_group:
         text = patch_top_level_user_group(text, nginx_user, nginx_group)
 
-    desired_listener_maps: Dict[Tuple[int, bool], List[str]] = defaultdict(list)
+    desired_listener_maps: Dict[Tuple[int, bool, str], List[str]] = defaultdict(list)
 
     for site in sites:
         if site.listens:
             for l in site.listens:
-                desired_listener_maps[(l.port, l.secure)].append(render_map_line(site))
+                desired_listener_maps[(l.port, l.secure, l.family)].append(render_map_line(site))
         else:
-            desired_listener_maps[(80, False)].append(render_map_line(site))
+            desired_listener_maps[(80, False, "ipv4")].append(render_map_line(site))
 
     for k in list(desired_listener_maps.keys()):
         desired_listener_maps[k] = dedupe_preserve(sorted(desired_listener_maps[k]))
 
     listener_blocks = parse_listener_blocks(text)
-    existing_listener_keys: Set[Tuple[int, bool]] = set()
+    managed_span = find_global_managed_span(text)
+    external_listener_keys: Set[Tuple[int, bool, str]] = set()
     for lb in listener_blocks:
-        if lb.port is not None:
-            existing_listener_keys.add((lb.port, lb.secure))
+        if lb.port is None:
+            continue
+        key = (lb.port, lb.secure, lb.family)
+        if managed_span and managed_span[0] <= lb.start < managed_span[1]:
+            continue
+        external_listener_keys.add(key)
 
     replacements = []
     used_existing_keys = set()
@@ -2060,7 +2124,7 @@ def patch_httpd_config(
     for lb in listener_blocks:
         if lb.port is None:
             continue
-        key = (lb.port, lb.secure)
+        key = (lb.port, lb.secure, lb.family)
         if key not in desired_listener_maps:
             continue
 
@@ -2077,11 +2141,11 @@ def patch_httpd_config(
 
     missing_listener_blocks = []
     for key, map_lines in sorted(desired_listener_maps.items()):
-        if key in used_existing_keys or key in existing_listener_keys:
+        if key in external_listener_keys:
             continue
-        port, secure = key
-        lname = f"nginx_migrated_{'https' if secure else 'http'}_{port}"
-        missing_listener_blocks.append(render_listener_block(lname, port, secure, map_lines))
+        port, secure, family = key
+        lname = f"{'IPv6' if family == 'ipv6' else 'IPv4'}_migrated_{port}"
+        missing_listener_blocks.append(render_listener_block(lname, port, secure, family, map_lines))
 
     php_apps = sorted({s.php_app for s in sites if s.php_app})
     ext_blocks = [render_php_extprocessor(app) for app in php_apps]
@@ -2211,14 +2275,20 @@ def reinstall_and_restart_ols():
     if not cmd:
         raise RuntimeError("Could not determine package manager for OpenLiteSpeed reinstall")
 
+    def run_cmd(cmd: List[str]):
+        if TERM.verbose:
+            subprocess.run(cmd, check=True)
+        else:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
     TERM.info_kv("Running", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    run_cmd(cmd)
 
     TERM.info_kv("Removing", "/tmp/lshttpd/")
     shutil.rmtree("/tmp/lshttpd", ignore_errors=True)
 
     TERM.info_kv("Restarting", "lsws")
-    subprocess.run(["systemctl", "restart", "lsws"], check=True)
+    run_cmd(["systemctl", "restart", "lsws"])
 
     TERM.ok("OpenLiteSpeed reinstall/reset/restart completed")
 
@@ -2252,7 +2322,10 @@ def build_report(
 
     lines.append("Sites:")
     for s in sites:
-        listens = ", ".join([f"{l.port}{'/ssl' if l.secure else ''}" for l in s.listens]) or "80"
+        listens = ", ".join([
+            f"{l.port}{'/ssl' if l.secure else ''}{'/v6' if l.family == 'ipv6' else ''}"
+            for l in s.listens
+        ]) or "80"
         lines.append(f"- {s.name}")
         lines.append(f"  primary: {s.primary_host}")
         lines.append(f"  aliases: {', '.join(s.aliases) if s.aliases else '-'}")
