@@ -1,1912 +1,2506 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+# -*- coding: utf-8 -*-
 
 import argparse
-import datetime as dt
+import copy
+import datetime
 import glob
 import json
 import os
 import re
 import shutil
-import stat
+import subprocess
 import sys
-from dataclasses import dataclass, field
+import time
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
 
-GLOBAL_BEGIN_LISTENERS = "# BEGIN NGINX_TO_OLS MANAGED LISTENERS"
-GLOBAL_END_LISTENERS = "# END NGINX_TO_OLS MANAGED LISTENERS"
-GLOBAL_BEGIN_VHOSTS = "# BEGIN NGINX_TO_OLS MANAGED VHOSTS"
-GLOBAL_END_VHOSTS = "# END NGINX_TO_OLS MANAGED VHOSTS"
-GLOBAL_BEGIN_EXTPROC = "# BEGIN NGINX_TO_OLS MANAGED EXTPROCESSORS"
-GLOBAL_END_EXTPROC = "# END NGINX_TO_OLS MANAGED EXTPROCESSORS"
-INNER_BEGIN_MAPS = "# BEGIN NGINX_TO_OLS MAPS"
-INNER_END_MAPS = "# END NGINX_TO_OLS MAPS"
+DEFAULT_NGINX = "/etc/nginx"
+DEFAULT_OLS_HTTPD = "/usr/local/lsws/conf/httpd_config.conf"
+DEFAULT_OLS_VHOSTS_ROOT = "/usr/local/lsws/conf/vhosts"
+DEFAULT_OUTPUT = "ols_migration_conf_preview"
 
-DEFAULT_DOCROOT = "/var/www/html"
-DEFAULT_INDEX_HTML = ["index.html", "index.htm"]
-DEFAULT_INDEX_PHP = ["index.php", "index.html", "index.htm"]
+DEFAULT_SECURE_LISTENER_KEY = "/usr/local/lsws/admin/conf/webadmin.key"
+DEFAULT_SECURE_LISTENER_CERT = "/usr/local/lsws/admin/conf/webadmin.crt"
 
-# FIXED: secure listener defaults
-DEFAULT_OLS_WEBADMIN_KEY = "/usr/local/lsws/admin/conf/webadmin.key"
-DEFAULT_OLS_WEBADMIN_CERT = "/usr/local/lsws/admin/conf/webadmin.crt"
+LISTENER_MAP_BEGIN = "# BEGIN NGINX_TO_OLS MAPS"
+LISTENER_MAP_END = "# END NGINX_TO_OLS MAPS"
+GLOBAL_MANAGED_BEGIN = "# BEGIN NGINX_TO_OLS MANAGED"
+GLOBAL_MANAGED_END = "# END NGINX_TO_OLS MANAGED"
 
-DEFAULT_OUTPUT_DIR = "ols_migration_conf_preview"
+# ============================================================
+# Terminal / output helpers
+# ============================================================
+
+class Terminal:
+    ANSI_RESET = "\033[0m"
+    ANSI_BOLD = "\033[1m"
+    ANSI_DIM = "\033[2m"
+
+    ANSI_COLORS = {
+        "red": "\033[31m",
+        "green": "\033[32m",
+        "yellow": "\033[33m",
+        "blue": "\033[34m",
+        "magenta": "\033[35m",
+        "cyan": "\033[36m",
+        "white": "\033[37m",
+        "gray": "\033[90m",
+    }
+
+    def __init__(self, quiet: bool = False, verbose: bool = False, no_color: bool = False):
+        self.quiet = quiet
+        self.verbose = verbose
+        self.color_enabled = (
+            sys.stdout.isatty()
+            and not no_color
+            and os.environ.get("NO_COLOR") is None
+            and os.environ.get("TERM", "") not in ("", "dumb")
+        )
+
+    def colorize(self, text: str, color: Optional[str] = None, bold: bool = False, dim: bool = False) -> str:
+        if not self.color_enabled:
+            return text
+        parts = []
+        if bold:
+            parts.append(self.ANSI_BOLD)
+        if dim:
+            parts.append(self.ANSI_DIM)
+        if color and color in self.ANSI_COLORS:
+            parts.append(self.ANSI_COLORS[color])
+        parts.append(text)
+        parts.append(self.ANSI_RESET)
+        return "".join(parts)
+
+    def _status(self, tag: str, message: str):
+        tag_upper = tag.upper()
+        if self.quiet and tag_upper in ("INFO", "OK", "NOTE", "DEBUG"):
+            return
+
+        color = {
+            "INFO": "cyan",
+            "OK": "green",
+            "WARN": "yellow",
+            "ERROR": "red",
+            "NOTE": "magenta",
+            "DEBUG": "gray",
+        }.get(tag_upper, "white")
+        print(f"{self.colorize(f'[{tag_upper}]', color, bold=True)} {message}")
+
+    def info(self, message: str):
+        self._status("INFO", message)
+
+    def ok(self, message: str):
+        self._status("OK", message)
+
+    def warn(self, message: str):
+        self._status("WARN", message)
+
+    def error(self, message: str):
+        self._status("ERROR", message)
+
+    def note(self, message: str):
+        self._status("NOTE", message)
+
+    def debug(self, message: str):
+        if self.verbose and not self.quiet:
+            self._status("DEBUG", message)
+
+    def info_kv(self, key: str, value: str = ""):
+        if self.quiet:
+            return
+        if value:
+            self._status("INFO", f"{key:<34} {value}")
+        else:
+            self._status("INFO", key)
+
+    def title(self, title: str):
+        if self.quiet:
+            return
+        line = "=" * 72
+        print(self.colorize(line, "cyan", bold=True))
+        print(self.colorize(title, "cyan", bold=True))
+        print(self.colorize(line, "cyan", bold=True))
+
+    def kv(self, key: str, value: str, value_color: Optional[str] = None):
+        if self.quiet:
+            return
+        label = f"{key:<26}"
+        print(f"{self.colorize(label, 'blue', bold=True)} {self.colorize(str(value), value_color)}")
+
+    def warning_count_color(self, count: int) -> str:
+        if count <= 0:
+            return "green"
+        return "yellow"
+
+    def print_warning_summary(self, warnings: List["WarningEntry"], limit: int = 8):
+        if self.quiet or not warnings:
+            return
+        counts = Counter(w.message for w in warnings).most_common(limit)
+        self.warn(f"Top warning types ({len(counts)} shown):")
+        for msg, count in counts:
+            print(f"  - {self.colorize(str(count).rjust(3), 'yellow', bold=True)} x {msg}")
+
+TERM = Terminal()
+
+# ============================================================
+# Data classes
+# ============================================================
 
 @dataclass
-class WarningItem:
-    level: str
+class WarningEntry:
     message: str
-    file: str = ""
+    source: str = ""
     line: int = 0
     site: str = ""
-
-    def to_dict(self) -> dict:
-        return {
-            "level": self.level,
-            "message": self.message,
-            "file": self.file,
-            "line": self.line,
-            "site": self.site,
-        }
-
-@dataclass
-class Token:
-    type: str
-    value: str
-    line: int
 
 @dataclass
 class Node:
     name: str
-    args: List[str]
-    children: List["Node"]
-    file: str
-    line: int
+    args: List[str] = field(default_factory=list)
+    children: List["Node"] = field(default_factory=list)
+    line: int = 0
+    source: str = ""
+
+@dataclass(eq=True, frozen=True)
+class ListenSpec:
+    port: int
+    secure: bool = False
+    default_server: bool = False
 
 @dataclass
 class NginxLocation:
-    modifier: str = ""
-    path: str = "/"
+    path: str
+    match_type: str  # exact, prefix, prefix_no_regex, regex
+    source: str
+    line: int
+    regex_case_insensitive: bool = False
     root: Optional[str] = None
     alias: Optional[str] = None
-    index_files: List[str] = field(default_factory=list)
+    index: List[str] = field(default_factory=list)
     try_files: List[str] = field(default_factory=list)
-    proxy_pass: Optional[str] = None
+    allow: List[str] = field(default_factory=list)
+    deny: List[str] = field(default_factory=list)
     fastcgi_pass: Optional[str] = None
-    websocket_hint: bool = False
-    add_headers: List[str] = field(default_factory=list)
+    proxy_pass: Optional[str] = None
+    rewrite_directives: List[List[str]] = field(default_factory=list)
+    return_args: List[str] = field(default_factory=list)
+    add_headers: List[List[str]] = field(default_factory=list)
+    more_set_headers: List[str] = field(default_factory=list)
     expires: Optional[str] = None
-    deny_all: bool = False
     access_log_off: bool = False
-    file: str = ""
-    line: int = 0
+    log_not_found_off: bool = False
+    limit_req: List[str] = field(default_factory=list)
+    children: List["NginxLocation"] = field(default_factory=list)
 
 @dataclass
 class NginxServer:
-    file: str
+    source: str
     line: int
-    server_names: List[str] = field(default_factory=list)
-    listen_specs: Set[Tuple[int, bool]] = field(default_factory=set)
+    raw_server_names: List[str] = field(default_factory=list)
+    primary_host: str = "default"
+    aliases: List[str] = field(default_factory=list)
     root: Optional[str] = None
-    index_files: List[str] = field(default_factory=list)
-    try_files: List[str] = field(default_factory=list)
+    index: List[str] = field(default_factory=list)
     access_log: Optional[str] = None
+    error_log: Optional[str] = None
+    listens: List[ListenSpec] = field(default_factory=list)
     ssl_cert: Optional[str] = None
     ssl_key: Optional[str] = None
     ssl_trusted_cert: Optional[str] = None
-    enable_stapling: bool = False
-    add_headers: List[str] = field(default_factory=list)
-    locations: List[NginxLocation] = field(default_factory=list)
+    ssl_stapling: bool = False
     enable_expires: bool = False
-    # FIXED: track default_server-like server blocks
-    default_server_like: bool = False
+    php_app: Optional[str] = None
+    locations: List[NginxLocation] = field(default_factory=list)
 
 @dataclass
-class NginxUpstream:
-    name: str
-    file: str
-    line: int
-    servers: List[str] = field(default_factory=list)
+class ContextSpec:
+    uri: str
+    location: str
+    allow_browse: int = 1
+    allow: List[str] = field(default_factory=list)
+    deny: List[str] = field(default_factory=list)
+    source: str = ""
+    line: int = 0
 
 @dataclass
 class Site:
-    source_files: Set[str] = field(default_factory=set)
-    vhost_name: str = ""
-    server_names: List[str] = field(default_factory=list)
-    listen_specs: Set[Tuple[int, bool]] = field(default_factory=set)
+    name: str
+    primary_host: str
+    aliases: List[str] = field(default_factory=list)
+    source_refs: List[str] = field(default_factory=list)
     root: Optional[str] = None
-    index_files: List[str] = field(default_factory=list)
-    try_files: List[str] = field(default_factory=list)
+    index: List[str] = field(default_factory=list)
     access_log: Optional[str] = None
+    error_log: Optional[str] = None
+    listens: List[ListenSpec] = field(default_factory=list)
     ssl_cert: Optional[str] = None
     ssl_key: Optional[str] = None
     ssl_trusted_cert: Optional[str] = None
-    enable_stapling: bool = False
-    locations: List[NginxLocation] = field(default_factory=list)
+    ssl_stapling: bool = False
     php_app: Optional[str] = None
-    php_socket_source: Optional[str] = None
-    add_headers: List[str] = field(default_factory=list)
     enable_expires: bool = False
+    contexts: List[ContextSpec] = field(default_factory=list)
+    rewrite_rules: List[str] = field(default_factory=list)
+    front_controller_rules: List[str] = field(default_factory=list)
 
 @dataclass
-class PhpApp:
-    name: str
-    binary_path: str
-    uds_address: str
-
-@dataclass
-class ProxyApp:
-    name: str
-    address: str
-
-@dataclass
-class ExistingListener:
+class ListenerBlockInfo:
     name: str
     start: int
+    brace_pos: int
     end: int
-    text: str
+    body: str
     port: Optional[int]
     secure: bool
 
-def warn(warnings: List[WarningItem], message: str,
-         file: str = "", line: int = 0, site: str = "", level: str = "warn") -> None:
-    warnings.append(WarningItem(level=level, message=message, file=file, line=line, site=site))
+# ============================================================
+# Small helpers
+# ============================================================
 
-def now_stamp() -> str:
-    return dt.datetime.now().strftime("%Y%m%d%H%M%S")
+def add_warning(warnings: List[WarningEntry], message: str, source: str = "", line: int = 0, site: str = ""):
+    warnings.append(WarningEntry(message=message, source=source, line=line, site=site))
 
-def sanitize_name(name: str) -> str:
-    name = (name or "").strip()
+def dedupe_preserve(items: List[str]) -> List[str]:
+    out = []
+    seen = set()
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def dedupe_listens(items: List[ListenSpec]) -> List[ListenSpec]:
+    seen = set()
+    out = []
+    for x in items:
+        key = (x.port, x.secure, x.default_server)
+        if key not in seen:
+            seen.add(key)
+            out.append(x)
+    return out
+
+def normalize_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+def path_has_scheme(path: Optional[str]) -> bool:
+    return bool(path and "://" in path)
+
+def root_score(root: Optional[str]) -> int:
+    if not root:
+        return 0
+    r = root.rstrip("/")
+    if r == "/var/www/html":
+        return 10
+    score = 20 + min(len(r), 200)
+    for token in ("/htdocs", "/public_html", "/public", "/html"):
+        if token in r:
+            score += 20
+    if "://" in r:
+        score -= 200
+    if "/.well-known" in r:
+        score -= 50
+    return score
+
+def choose_better_root(current: Optional[str], new: Optional[str]) -> Optional[str]:
+    if not current:
+        return new
+    if not new:
+        return current
+    if root_score(new) > root_score(current):
+        return new
+    return current
+
+def prefer_index(current: List[str], new: List[str]) -> List[str]:
+    if not current:
+        return new
+    if len(new) > len(current):
+        return new
+    return current
+
+def sanitize_site_name(name: str) -> str:
     if not name:
-        return "migrated-site"
-    name = name.replace("*", "wildcard")
-    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name)
-    name = re.sub(r"-{2,}", "-", name).strip("-")
-    return name or "migrated-site"
+        return "default"
+    if name in ("_", "localhost") or name.startswith("127.") or name.isdigit():
+        return "default"
+    n = name.lower().strip()
+    if n.startswith("*."):
+        n = "wildcard-" + n[2:]
+    n = n.replace("*", "wildcard")
+    n = re.sub(r"[^a-z0-9._-]+", "-", n)
+    n = n.strip(".-")
+    return n or "default"
 
-def ensure_unique_name(base: str, used: Set[str]) -> str:
-    candidate = sanitize_name(base)
-    if candidate not in used:
-        used.add(candidate)
-        return candidate
-    idx = 2
-    while True:
-        c = f"{candidate}-migrated{idx}"
-        if c not in used:
-            used.add(c)
-            return c
-        idx += 1
+def is_invalid_server_name(name: str) -> bool:
+    if not name:
+        return True
+    if name in ("_", "localhost"):
+        return True
+    if name.startswith("127."):
+        return True
+    if name in ("::1", "[::1]"):
+        return True
+    if name.isdigit():
+        return True
+    if name.startswith("~"):
+        return True
+    return False
 
-def json_dump(obj, path: Path) -> None:
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+def first_non_wildcard_name(names: List[str]) -> Optional[str]:
+    for n in names:
+        if n and not n.startswith("*.") and not is_invalid_server_name(n):
+            return n
+    return None
 
-def backup_file(path: Path) -> Optional[Path]:
+def backup_file(path: Path):
     if not path.exists():
-        return None
-    bak = path.with_name(path.name + f".bak.{now_stamp()}")
+        return
+    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    bak = path.with_name(path.name + f".bak.{ts}")
     shutil.copy2(path, bak)
-    return bak
 
-def file_identity(path: Path) -> Tuple[Tuple[int, int], Path]:
-    real = path.resolve()
-    st = os.stat(real)
-    return (st.st_dev, st.st_ino), real
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
 
-def read_text_file(path: Path) -> str:
+def slurp(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+def spit(path: Path, data: str):
+    ensure_dir(path.parent)
+    path.write_text(data, encoding="utf-8")
+
+def inode_identity(path: Path) -> Optional[Tuple[int, int]]:
     try:
-        return path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return path.read_text(encoding="utf-8", errors="replace")
+        st = path.stat()
+        return (st.st_dev, st.st_ino)
+    except Exception:
+        return None
 
-def tokenize_nginx(text: str) -> List[Token]:
-    tokens: List[Token] = []
+def is_named_location_path(path: str) -> bool:
+    return path.strip().startswith("@")
+
+def safe_int(s: str, default: int = 0) -> int:
+    try:
+        return int(s)
+    except Exception:
+        return default
+
+# ============================================================
+# Tokenizer / parser
+# ============================================================
+
+def tokenize_nginx(text: str) -> List[Tuple[str, int]]:
+    tokens: List[Tuple[str, int]] = []
     i = 0
     line = 1
     n = len(text)
 
     while i < n:
-        ch = text[i]
+        c = text[i]
 
-        if ch in " \t\r":
+        if c in " \t\r":
             i += 1
             continue
-        if ch == "\n":
+
+        if c == "\n":
             line += 1
             i += 1
             continue
-        if ch == "#":
+
+        if c == "#":
             while i < n and text[i] != "\n":
                 i += 1
             continue
-        if ch == "{":
-            tokens.append(Token("LBRACE", "{", line))
+
+        if c in "{};":
+            tokens.append((c, line))
             i += 1
             continue
-        if ch == "}":
-            tokens.append(Token("RBRACE", "}", line))
-            i += 1
-            continue
-        if ch == ";":
-            tokens.append(Token("SEMI", ";", line))
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            q = ch
+
+        if c in ("'", '"'):
+            q = c
             start_line = line
             i += 1
             buf = []
             while i < n:
-                c = text[i]
-                if c == "\\" and i + 1 < n:
+                ch = text[i]
+                if ch == "\\" and i + 1 < n:
                     buf.append(text[i + 1])
                     i += 2
                     continue
-                if c == q:
+                if ch == q:
                     i += 1
                     break
-                if c == "\n":
+                if ch == "\n":
                     line += 1
-                buf.append(c)
+                buf.append(ch)
                 i += 1
-            tokens.append(Token("WORD", "".join(buf), start_line))
+            tokens.append(("".join(buf), start_line))
             continue
 
-        start_line = line
-        buf = []
-        while i < n:
-            c = text[i]
-            if c in " \t\r\n{};":
-                break
-            if c == "#":
-                break
-            buf.append(c)
+        start = i
+        while i < n and text[i] not in " \t\r\n{};#":
             i += 1
-        if buf:
-            tokens.append(Token("WORD", "".join(buf), start_line))
-            continue
-
-        i += 1
+        tokens.append((text[start:i], line))
 
     return tokens
 
-def parse_nginx_tokens(tokens: List[Token], file_path: str, pos: int = 0, stop_on_rbrace: bool = False):
+def parse_nginx_tokens(tokens: List[Tuple[str, int]], source: str, start_idx: int = 0) -> Tuple[List[Node], int]:
     nodes: List[Node] = []
+    i = start_idx
+    total = len(tokens)
 
-    while pos < len(tokens):
-        tok = tokens[pos]
+    while i < total:
+        tok, line = tokens[i]
 
-        if tok.type == "RBRACE":
-            if stop_on_rbrace:
-                return nodes, pos + 1
-            pos += 1
+        if tok == "}":
+            return nodes, i + 1
+
+        if tok in ("{", ";"):
+            i += 1
             continue
 
-        if tok.type != "WORD":
-            pos += 1
-            continue
-
-        name = tok.value
-        line = tok.line
-        pos += 1
-
+        name = tok
         args: List[str] = []
-        while pos < len(tokens) and tokens[pos].type == "WORD":
-            args.append(tokens[pos].value)
-            pos += 1
+        i += 1
 
-        if pos >= len(tokens):
-            nodes.append(Node(name=name, args=args, children=[], file=file_path, line=line))
-            break
+        while i < total:
+            tok2, _ = tokens[i]
 
-        if tokens[pos].type == "SEMI":
-            nodes.append(Node(name=name, args=args, children=[], file=file_path, line=line))
-            pos += 1
-            continue
+            if tok2 == ";":
+                nodes.append(Node(name=name, args=args, children=[], line=line, source=source))
+                i += 1
+                break
 
-        if tokens[pos].type == "LBRACE":
-            children, pos = parse_nginx_tokens(tokens, file_path, pos + 1, stop_on_rbrace=True)
-            nodes.append(Node(name=name, args=args, children=children, file=file_path, line=line))
-            continue
+            if tok2 == "{":
+                children, i = parse_nginx_tokens(tokens, source, i + 1)
+                nodes.append(Node(name=name, args=args, children=children, line=line, source=source))
+                break
 
-        nodes.append(Node(name=name, args=args, children=[], file=file_path, line=line))
-        pos += 1
+            if tok2 == "}":
+                nodes.append(Node(name=name, args=args, children=[], line=line, source=source))
+                return nodes, i
 
-    return nodes, pos
+            args.append(tok2)
+            i += 1
 
-def parse_nginx_text(text: str, file_path: str) -> List[Node]:
+    return nodes, i
+
+def parse_nginx_text(text: str, source: str) -> List[Node]:
     tokens = tokenize_nginx(text)
-    nodes, _ = parse_nginx_tokens(tokens, file_path)
+    nodes, _ = parse_nginx_tokens(tokens, source, 0)
     return nodes
 
-def walk_nodes(nodes: List[Node]):
-    for node in nodes:
-        yield node
-        if node.children:
-            yield from walk_nodes(node.children)
+def iter_nodes(nodes: List[Node]):
+    for n in nodes:
+        yield n
+        if n.children:
+            yield from iter_nodes(n.children)
 
-def parse_file_cached(path: Path, cache: Dict[Path, List[Node]]) -> List[Node]:
-    if path in cache:
-        return cache[path]
-    nodes = parse_nginx_text(read_text_file(path), str(path))
-    cache[path] = nodes
-    return nodes
+# ============================================================
+# Include expansion / discovery
+# ============================================================
 
-def resolve_include_pattern(base_file: Path, pattern: str) -> List[Path]:
-    p = Path(pattern)
-    if not p.is_absolute():
-        p = base_file.parent / pattern
-    matches = [Path(x) for x in glob.glob(str(p), recursive=True)]
-    return sorted([m for m in matches if m.is_file()])
+def resolve_include_pattern(pattern: str, current_file: Path, nginx_base: Path) -> List[Path]:
+    patterns = []
+    if os.path.isabs(pattern):
+        patterns.append(pattern)
+    else:
+        patterns.append(str(current_file.parent / pattern))
+        patterns.append(str(nginx_base / pattern))
 
-def expand_nodes(nodes: List[Node],
-                 current_file: Path,
-                 raw_cache: Dict[Path, List[Node]],
-                 expanded_cache: Dict[Path, List[Node]],
-                 warnings: List[WarningItem],
-                 stack: Set[Path]) -> List[Node]:
+    seen = set()
+    out = []
+    for pat in patterns:
+        matches = sorted(glob.glob(pat))
+        for m in matches:
+            p = Path(m)
+            if p.is_file():
+                rp = p.resolve()
+                if rp not in seen:
+                    seen.add(rp)
+                    out.append(rp)
+    return out
+
+def expand_nodes(nodes: List[Node], current_file: Path, ctx: dict, stack: List[Path]) -> List[Node]:
     out: List[Node] = []
-
     for node in nodes:
-        if node.name == "include":
-            for arg in node.args:
-                for inc in resolve_include_pattern(current_file, arg):
-                    out.extend(parse_nginx_file_expanded(inc, raw_cache, expanded_cache, warnings, stack))
+        if node.name == "include" and not node.children and node.args:
+            pattern = node.args[0]
+            include_files = resolve_include_pattern(pattern, current_file, ctx["nginx_base"])
+
+            if not include_files:
+                add_warning(ctx["warnings"], f"Included file/glob not found: {pattern}", source=str(current_file), line=node.line)
+
+            for inc in include_files:
+                if inc in stack:
+                    add_warning(ctx["warnings"], f"Include cycle detected, skipping: {inc}", source=str(current_file), line=node.line)
+                    continue
+                TERM.debug(f"Expanding include: {pattern} -> {inc}")
+                out.extend(parse_nginx_file_expanded(inc, ctx, stack + [inc]))
             continue
 
-        if node.children:
-            children = expand_nodes(node.children, current_file, raw_cache, expanded_cache, warnings, stack)
-            out.append(Node(name=node.name, args=node.args[:], children=children, file=node.file, line=node.line))
-        else:
-            out.append(Node(name=node.name, args=node.args[:], children=[], file=node.file, line=node.line))
+        new_children = expand_nodes(node.children, current_file, ctx, stack) if node.children else []
+        new_node = copy.deepcopy(node)
+        new_node.children = new_children
+        out.append(new_node)
+    return out
+
+def parse_nginx_file_expanded(path: Path, ctx: dict, stack: Optional[List[Path]] = None) -> List[Node]:
+    if stack is None:
+        stack = [path.resolve()]
+    real = path.resolve()
+    ctx["parsed_files"].add(str(real))
+    TERM.debug(f"Parsing nginx file: {real}")
+    try:
+        text = slurp(real)
+    except Exception as e:
+        add_warning(ctx["warnings"], f"Could not read nginx file: {real} ({e})", source=str(real))
+        return []
+    nodes = parse_nginx_text(text, str(real))
+    return expand_nodes(nodes, real, ctx, stack)
+
+def collect_source_files(nginx_path: Path) -> List[Path]:
+    nginx_path = nginx_path.resolve()
+    out: List[Path] = []
+    seen_ids: Set[Tuple[int, int]] = set()
+
+    def maybe_add(p: Path):
+        try:
+            if not p.is_file():
+                return
+        except Exception:
+            return
+        ident = inode_identity(p)
+        if ident and ident in seen_ids:
+            return
+        if ident:
+            seen_ids.add(ident)
+        out.append(p.resolve())
+
+    if nginx_path.is_file():
+        maybe_add(nginx_path)
+        return out
+
+    if not nginx_path.is_dir():
+        return out
+
+    special_found = False
+
+    nginx_conf = nginx_path / "nginx.conf"
+    if nginx_conf.exists():
+        special_found = True
+        maybe_add(nginx_conf)
+
+    for sub in ("conf.d", "sites-enabled", "sites-available"):
+        d = nginx_path / sub
+        if d.is_dir():
+            special_found = True
+            for root, _, files in os.walk(d):
+                for fn in files:
+                    maybe_add(Path(root) / fn)
+
+    if not special_found:
+        for root, _, files in os.walk(nginx_path):
+            for fn in files:
+                maybe_add(Path(root) / fn)
 
     return out
 
-def parse_nginx_file_expanded(path: Path,
-                              raw_cache: Dict[Path, List[Node]],
-                              expanded_cache: Dict[Path, List[Node]],
-                              warnings: List[WarningItem],
-                              stack: Set[Path]) -> List[Node]:
-    real = path.resolve()
+def expand_extra_include_inputs(items: List[str]) -> List[Path]:
+    out: List[Path] = []
+    seen_ids: Set[Tuple[int, int]] = set()
+    seen_paths: Set[Path] = set()
 
-    if real in expanded_cache:
-        return expanded_cache[real]
-
-    if real in stack:
-        warn(warnings, f"Detected include cycle at {real}; skipping recursive include.", file=str(real))
-        return []
-
-    stack.add(real)
-    raw_nodes = parse_file_cached(real, raw_cache)
-    expanded_nodes = expand_nodes(raw_nodes, real, raw_cache, expanded_cache, warnings, stack)
-    expanded_cache[real] = expanded_nodes
-    stack.remove(real)
-    return expanded_nodes
-
-def collect_nginx_sources(root: Path,
-                          warnings: List[WarningItem],
-                          extra_include_globs: Optional[List[str]] = None) -> Dict[Path, List[Node]]:
-    parsed: Dict[Path, List[Node]] = {}
-    raw_cache: Dict[Path, List[Node]] = {}
-    expanded_cache: Dict[Path, List[Node]] = {}
-    seen_top_identities: Set[Tuple[int, int]] = set()
-
-    def add_top_file(path: Path):
+    def maybe_add(p: Path):
         try:
-            ident, real = file_identity(path)
-        except OSError:
-            return
-        if ident in seen_top_identities:
-            return
-        if real in parsed:
-            return
-        if real in expanded_cache:
-            return
-        seen_top_identities.add(ident)
-        parsed[real] = parse_nginx_file_expanded(real, raw_cache, expanded_cache, warnings, set())
-
-    def add_root_file(path: Path):
-        try:
-            ident, real = file_identity(path)
-        except OSError as e:
-            warn(warnings, f"Could not stat file: {e}", file=str(path))
-            return
-        if ident in seen_top_identities:
-            return
-        seen_top_identities.add(ident)
-        parsed[real] = parse_nginx_file_expanded(real, raw_cache, expanded_cache, warnings, set())
-
-    def fallback_discover(directory: Path):
-        candidates: List[Path] = []
-        for p in directory.rglob("*"):
             if not p.is_file():
-                continue
-            if p.name.endswith(".conf"):
-                candidates.append(p)
-                continue
-            if any(part in ("sites-enabled", "conf.d", "sites-available") for part in p.parts):
-                candidates.append(p)
-        for p in sorted(set(candidates)):
-            add_top_file(p)
+                return
+        except Exception:
+            return
 
-    if root.is_file():
-        add_root_file(root)
-    else:
-        nginx_conf = root / "nginx.conf"
-        if nginx_conf.exists():
-            add_root_file(nginx_conf)
+        rp = p.resolve()
+        ident = inode_identity(rp)
+
+        if ident and ident in seen_ids:
+            return
+        if rp in seen_paths:
+            return
+
+        if ident:
+            seen_ids.add(ident)
+        seen_paths.add(rp)
+        out.append(rp)
+
+    for item in items or []:
+        if not item:
+            continue
+
+        if any(ch in item for ch in "*?[]"):
+            for m in sorted(glob.glob(item)):
+                maybe_add(Path(m))
+            continue
+
+        p = Path(item)
+        if p.is_file():
+            maybe_add(p)
+        elif p.is_dir():
+            for root, _, files in os.walk(p):
+                for fn in files:
+                    maybe_add(Path(root) / fn)
         else:
-            fallback_discover(root)
+            for m in sorted(glob.glob(item)):
+                maybe_add(Path(m))
 
-    for pattern in extra_include_globs or []:
-        for p in sorted(Path(x) for x in glob.glob(pattern, recursive=True)):
-            if p.is_file():
-                add_top_file(p)
+    return out
 
-    return parsed
+def parse_nginx_sources(nginx_path: Path, extra_include_globs: List[str], warnings: List[WarningEntry]) -> Tuple[List[Node], dict]:
+    ctx = {
+        "nginx_base": nginx_path.resolve() if nginx_path.is_dir() else nginx_path.resolve().parent,
+        "warnings": warnings,
+        "parsed_files": set(),
+        "extra_include_globs": extra_include_globs[:],
+    }
 
-LISTEN_FLAGS = {
-    "default_server", "ssl", "http2", "http3", "quic", "proxy_protocol",
-    "reuseport", "backlog", "so_keepalive", "bind", "deferred", "fastopen",
-    "ipv6only=on", "ipv6only=off"
-}
+    source_files = collect_source_files(nginx_path)
+    TERM.debug(f"Initial nginx source files: {len(source_files)}")
+    all_nodes: List[Node] = []
 
-def extract_port_from_listen_arg(arg: str) -> Optional[int]:
-    arg = arg.strip()
-    if arg.isdigit():
-        return int(arg)
-    if arg.startswith("unix:"):
-        return None
-    m = re.search(r":(\d+)$", arg)
-    if m:
-        return int(m.group(1))
-    return None
+    for src in source_files:
+        all_nodes.extend(parse_nginx_file_expanded(src, ctx, [src.resolve()]))
 
-def parse_listen(args: List[str]) -> Tuple[int, bool]:
-    ssl = any(a == "ssl" for a in args)
+    for p in expand_extra_include_inputs(extra_include_globs):
+        TERM.debug(f"Parsing extra include source: {p}")
+        all_nodes.extend(parse_nginx_file_expanded(p.resolve(), ctx, [p.resolve()]))
+
+    return all_nodes, ctx
+
+# ============================================================
+# Nginx interpretation
+# ============================================================
+
+def detect_nginx_user_group(all_nodes: List[Node]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    for node in iter_nodes(all_nodes):
+        if node.name == "user" and not node.children and node.args:
+            user = node.args[0]
+            group = node.args[1] if len(node.args) > 1 else node.args[0]
+            return user, group, f"{node.source}:{node.line}"
+    return None, None, None
+
+def collect_upstreams(all_nodes: List[Node], warnings: List[WarningEntry]) -> Dict[str, List[str]]:
+    upstreams: Dict[str, List[str]] = {}
+
+    for node in iter_nodes(all_nodes):
+        if node.name != "upstream" or not node.children or not node.args:
+            continue
+        name = node.args[0]
+        backends = []
+        for ch in node.children:
+            if ch.name == "server" and not ch.children and ch.args:
+                backends.append(ch.args[0])
+        if len(backends) > 1:
+            add_warning(
+                warnings,
+                f"Upstream '{name}' has multiple backends; only the first one may be used where needed: {backends[0]}",
+                source=node.source,
+                line=node.line,
+            )
+        upstreams[name] = backends
+
+    return upstreams
+
+def parse_listen(args: List[str]) -> ListenSpec:
     port = None
+    secure = False
+    default_server = False
 
     for a in args:
-        if a in LISTEN_FLAGS:
+        la = a.lower()
+
+        if la == "ssl":
+            secure = True
             continue
-        if "=" in a and a.split("=", 1)[0] in LISTEN_FLAGS:
+
+        if la == "default_server":
+            default_server = True
             continue
-        p = extract_port_from_listen_arg(a)
-        if p is not None:
-            port = p
-            break
+
+        if la in ("quic", "http2", "reuseport", "proxy_protocol", "backlog", "fastopen", "so_keepalive", "bind", "deferred", "ipv6only=on", "ipv6only=off"):
+            continue
+
+        if re.fullmatch(r"\d+", a):
+            port = int(a)
+            continue
+
+        m = re.search(r":(\d+)$", a)
+        if m:
+            port = int(m.group(1))
+            continue
 
     if port is None:
-        port = 443 if ssl else 80
+        port = 80
 
-    if port == 443:
-        ssl = True
+    return ListenSpec(port=port, secure=secure, default_server=default_server)
 
-    return port, ssl
-
-def parse_add_header(args: List[str], warnings: List[WarningItem], file: str, line: int) -> Optional[str]:
-    if len(args) < 2:
-        return None
-    name = args[0]
-    vals = args[1:]
-    if vals and vals[-1].lower() == "always":
-        vals = vals[:-1]
-    value = " ".join(vals).strip()
-    if not value:
-        return None
-    if "$" in name or "$" in value:
-        warn(warnings, "Variable-based add_header could not be converted automatically.", file=file, line=line)
-        return None
-    return f"{name}: {value}"
-
-def parse_more_set_headers(args: List[str], warnings: List[WarningItem], file: str, line: int) -> Optional[str]:
-    raw = " ".join(args).strip()
-    raw = re.sub(r"\s+always\s*$", "", raw, flags=re.I).strip()
-    if not raw:
-        return None
-    if "$" in raw:
-        warn(warnings, "Variable-based more_set_headers could not be converted automatically.", file=file, line=line)
+def infer_lsphp_app(target: str, upstreams: Dict[str, List[str]]) -> Optional[str]:
+    if not target:
         return None
 
-    m = re.match(r"^([^:\s]+)\s*:\s*(.+)$", raw)
-    if m:
-        name = m.group(1).strip()
-        value = m.group(2).strip()
-        if name and value:
-            return f"{name}: {value}"
+    candidates = [target]
+    if target in upstreams and upstreams[target]:
+        candidates.append(upstreams[target][0])
 
-    parts = raw.split(None, 1)
-    if len(parts) == 2:
-        name, value = parts[0].strip(), parts[1].strip()
-        if name and value:
-            return f"{name}: {value}"
+    for item in candidates:
+        s = item.strip()
 
-    warn(warnings, f"Could not parse more_set_headers value '{raw}'.", file=file, line=line)
+        m = re.search(r"php(\d+)\.(\d+)", s)
+        if m:
+            return f"lsphp{m.group(1)}{m.group(2)}"
+
+        m = re.search(r"php(\d)(\d)", s)
+        if m:
+            return f"lsphp{m.group(1)}{m.group(2)}"
+
+        m = re.search(r"(lsphp\d+)", s)
+        if m:
+            return m.group(1)
+
     return None
 
-def unique_preserve(items: List[str]) -> List[str]:
-    out = []
-    seen = set()
-    for x in items:
-        if x and x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+def parse_location(node: Node, upstreams: Dict[str, List[str]], warnings: List[WarningEntry]) -> NginxLocation:
+    args = node.args[:]
+    match_type = "prefix"
+    path = "/"
+    regex_case_insensitive = False
 
-# FIXED: invalid/default server-name helpers
-def is_invalid_server_name(name: str) -> bool:
-    n = (name or "").strip().lower()
-    return (
-        not n or
-        n in ("_", "localhost", "default_server") or
-        n.startswith("127.") or
-        n == "::1" or
-        n.isdigit()
+    if args:
+        if args[0] == "=" and len(args) >= 2:
+            match_type = "exact"
+            path = " ".join(args[1:])
+        elif args[0] == "~" and len(args) >= 2:
+            match_type = "regex"
+            path = " ".join(args[1:])
+        elif args[0] == "~*" and len(args) >= 2:
+            match_type = "regex"
+            path = " ".join(args[1:])
+            regex_case_insensitive = True
+        elif args[0] == "^~" and len(args) >= 2:
+            match_type = "prefix_no_regex"
+            path = " ".join(args[1:])
+        else:
+            match_type = "prefix"
+            path = " ".join(args)
+
+    loc = NginxLocation(
+        path=path,
+        match_type=match_type,
+        source=node.source,
+        line=node.line,
+        regex_case_insensitive=regex_case_insensitive,
     )
 
-def is_wildcard_server_name(name: str) -> bool:
-    return "*" in (name or "")
-
-def first_valid_non_wildcard_name(names: List[str]) -> Optional[str]:
-    for n in names:
-        if not is_invalid_server_name(n) and not is_wildcard_server_name(n):
-            return n
-    return None
-
-def first_valid_name(names: List[str]) -> Optional[str]:
-    non_wild = first_valid_non_wildcard_name(names)
-    if non_wild:
-        return non_wild
-    for n in names:
-        if not is_invalid_server_name(n):
-            return n
-    return None
-
-def filter_listener_domains(names: List[str]) -> List[str]:
-    # Prefer exact non-wildcard valid names; if none exist, fall back to any non-invalid names.
-    exact = [n for n in names if not is_invalid_server_name(n) and not is_wildcard_server_name(n)]
-    if exact:
-        return unique_preserve(exact)
-    broad = [n for n in names if not is_invalid_server_name(n)]
-    return unique_preserve(broad)
-
-def parse_location(node: Node, warnings: List[WarningItem]) -> NginxLocation:
-    modifier = ""
-    path = "/"
-
-    if node.args:
-        if node.args[0] in ("=", "~", "~*", "^~"):
-            modifier = node.args[0]
-            path = " ".join(node.args[1:]) if len(node.args) > 1 else "/"
-        else:
-            path = " ".join(node.args)
-
-    loc = NginxLocation(modifier=modifier, path=path, file=node.file, line=node.line)
-
     for ch in node.children:
-        n = ch.name
-        a = ch.args
+        if ch.name == "location" and ch.children:
+            loc.children.append(parse_location(ch, upstreams, warnings))
+            continue
 
-        if n == "root" and a:
-            loc.root = a[0]
-        elif n == "alias" and a:
-            loc.alias = a[0]
-        elif n == "index" and a:
-            loc.index_files = a[:]
-        elif n == "try_files" and a:
-            loc.try_files = a[:]
-        elif n == "proxy_pass" and a:
-            loc.proxy_pass = a[0]
-        elif n == "fastcgi_pass" and a:
-            loc.fastcgi_pass = a[0]
-        elif n == "proxy_set_header" and len(a) >= 2:
-            hdr = a[0].lower()
-            if hdr in ("upgrade", "connection"):
-                loc.websocket_hint = True
-        elif n == "add_header" and a:
-            h = parse_add_header(a, warnings, ch.file, ch.line)
-            if h:
-                loc.add_headers.append(h)
-        elif n == "more_set_headers" and a:
-            h = parse_more_set_headers(a, warnings, ch.file, ch.line)
-            if h:
-                loc.add_headers.append(h)
-        elif n == "expires" and a:
-            loc.expires = " ".join(a)
-        elif n == "deny" and a and a[0].lower() == "all":
-            loc.deny_all = True
-        elif n == "access_log" and a and a[0].lower() == "off":
+        if ch.name == "if":
+            add_warning(warnings, "Unsupported nginx 'if' inside location; skipped", source=ch.source, line=ch.line)
+            continue
+
+        if ch.name == "root" and ch.args and not loc.root:
+            loc.root = " ".join(ch.args)
+            continue
+
+        if ch.name == "alias" and ch.args and not loc.alias:
+            loc.alias = " ".join(ch.args)
+            continue
+
+        if ch.name == "index" and ch.args and not loc.index:
+            loc.index = ch.args[:]
+            continue
+
+        if ch.name == "try_files" and ch.args:
+            loc.try_files = ch.args[:]
+            continue
+
+        if ch.name == "allow" and ch.args:
+            loc.allow.append(ch.args[0])
+            continue
+
+        if ch.name == "deny" and ch.args:
+            loc.deny.append(ch.args[0])
+            continue
+
+        if ch.name == "fastcgi_pass" and ch.args and not loc.fastcgi_pass:
+            loc.fastcgi_pass = " ".join(ch.args)
+            continue
+
+        if ch.name == "proxy_pass" and ch.args and not loc.proxy_pass:
+            loc.proxy_pass = " ".join(ch.args)
+            continue
+
+        if ch.name == "rewrite" and ch.args:
+            loc.rewrite_directives.append(ch.args[:])
+            continue
+
+        if ch.name == "return" and ch.args and not loc.return_args:
+            loc.return_args = ch.args[:]
+            continue
+
+        if ch.name == "add_header" and ch.args:
+            loc.add_headers.append(ch.args[:])
+            continue
+
+        if ch.name == "more_set_headers" and ch.args:
+            loc.more_set_headers.append(" ".join(ch.args))
+            continue
+
+        if ch.name == "expires" and ch.args and not loc.expires:
+            loc.expires = " ".join(ch.args)
+            continue
+
+        if ch.name == "access_log" and ch.args and ch.args[0] == "off":
             loc.access_log_off = True
-        elif n == "if":
-            warn(warnings, "Unsupported nginx 'if' inside location; review manually.", file=ch.file, line=ch.line)
-        elif n == "location":
-            warn(warnings, "Nested location block found; review manually.", file=ch.file, line=ch.line)
-        elif n == "rewrite":
-            warn(warnings, "Raw nginx rewrite directive not directly converted; review manually.", file=ch.file, line=ch.line)
-        elif n == "error_page":
-            warn(warnings, "nginx error_page is not directly converted; review manually.", file=ch.file, line=ch.line)
-        elif n in ("ssl_protocols", "ssl_prefer_server_ciphers"):
-            warn(warnings,
-                 f"nginx '{n}' inside location is ignored; in OLS TLS settings belong to secure listener level.",
-                 file=ch.file, line=ch.line)
+            continue
 
-    if loc.modifier in ("~", "~*"):
-        php_like = bool(re.search(r"\\\.php\$|\.php\$|php", loc.path))
-        if not php_like and not loc.expires:
-            warn(warnings,
-                 f"Regex location '{loc.modifier} {loc.path}' is not fully converted; review manually.",
-                 file=loc.file, line=loc.line)
+        if ch.name == "log_not_found" and ch.args and ch.args[0] == "off":
+            loc.log_not_found_off = True
+            continue
 
-    if loc.websocket_hint:
-        warn(warnings, "WebSocket-related proxy headers detected; review proxy context manually.", file=loc.file, line=loc.line)
+        if ch.name == "limit_req" and ch.args:
+            loc.limit_req.append(" ".join(ch.args))
+            continue
 
-    loc.add_headers = unique_preserve(loc.add_headers)
     return loc
 
-def parse_server(node: Node, warnings: List[WarningItem]) -> NginxServer:
-    srv = NginxServer(file=node.file, line=node.line)
+def choose_server_identity(server_names: List[str], listens: List[ListenSpec], warnings: List[WarningEntry], source: str, line: int) -> Tuple[str, List[str]]:
+    raw = [x for x in server_names if x]
+    valid = []
+    wildcard = []
+    invalid = []
 
-    for ch in node.children:
-        n = ch.name
-        a = ch.args
-
-        if n == "listen":
-            if "quic" in a:
-                continue
-            port, secure = parse_listen(a)
-            srv.listen_specs.add((port, secure))
-            if "default_server" in a:
-                srv.default_server_like = True
-        elif n == "server_name" and a:
-            srv.server_names.extend(a)
-        elif n == "root" and a:
-            srv.root = a[0]
-        elif n == "index" and a:
-            srv.index_files = a[:]
-        elif n == "try_files" and a:
-            srv.try_files = a[:]
-        elif n == "access_log" and a:
-            if a[0].lower() != "off":
-                srv.access_log = a[0]
-        elif n == "ssl_certificate" and a:
-            srv.ssl_cert = a[0]
-        elif n == "ssl_certificate_key" and a:
-            srv.ssl_key = a[0]
-        elif n == "ssl_trusted_certificate" and a:
-            srv.ssl_trusted_cert = a[0]
-        elif n in ("ssl_stapling", "ssl_stapling_verify") and a and a[0].lower() == "on":
-            srv.enable_stapling = True
-        elif n == "add_header" and a:
-            h = parse_add_header(a, warnings, ch.file, ch.line)
-            if h:
-                srv.add_headers.append(h)
-        elif n == "more_set_headers" and a:
-            h = parse_more_set_headers(a, warnings, ch.file, ch.line)
-            if h:
-                srv.add_headers.append(h)
-        elif n == "expires" and a:
-            srv.enable_expires = True
-        elif n == "location":
-            loc = parse_location(ch, warnings)
-            srv.locations.append(loc)
-            if loc.expires:
-                srv.enable_expires = True
-        elif n == "if":
-            warn(warnings, "Unsupported nginx 'if' inside server; review manually.", file=ch.file, line=ch.line)
-        elif n == "error_page":
-            warn(warnings, "nginx error_page is not directly converted; review manually.", file=ch.file, line=ch.line)
-        elif n == "return":
-            warn(warnings, "nginx return directive not directly converted; review manually.", file=ch.file, line=ch.line)
-        elif n in ("ssl_protocols", "ssl_prefer_server_ciphers"):
-            warn(warnings,
-                 f"nginx '{n}' is ignored in vhost conversion; in OLS TLS settings belong to secure listener level.",
-                 file=ch.file, line=ch.line)
-
-    if not srv.listen_specs:
-        srv.listen_specs.add((80, False))
-
-    root_loc = None
-    for loc in srv.locations:
-        if loc.path == "/" and loc.modifier in ("", "^~"):
-            root_loc = loc
-            break
-
-    if root_loc:
-        if not srv.root and root_loc.root:
-            srv.root = root_loc.root
-        if not srv.index_files and root_loc.index_files:
-            srv.index_files = root_loc.index_files[:]
-        if not srv.try_files and root_loc.try_files:
-            srv.try_files = root_loc.try_files[:]
-
-    if srv.ssl_cert or srv.ssl_key:
-        new_specs = set()
-        for port, secure in srv.listen_specs:
-            if port == 443:
-                secure = True
-            new_specs.add((port, secure))
-        srv.listen_specs = new_specs
-
-    if srv.root and "://" in srv.root:
-        warn(warnings,
-             f"Suspicious nginx root path '{srv.root}' contains '://'; review manually.",
-             file=srv.file, line=srv.line)
-
-    srv.add_headers = unique_preserve(srv.add_headers)
-    return srv
-
-def extract_nginx_objects(parsed: Dict[Path, List[Node]], warnings: List[WarningItem]):
-    servers: List[NginxServer] = []
-    upstreams: Dict[str, NginxUpstream] = {}
-
-    for _, nodes in parsed.items():
-        for node in walk_nodes(nodes):
-            if node.name == "upstream" and node.children and node.args:
-                up = NginxUpstream(name=node.args[0], file=node.file, line=node.line)
-                for ch in node.children:
-                    if ch.name == "server" and ch.args:
-                        up.servers.append(ch.args[0])
-                upstreams[up.name] = up
-            elif node.name == "server" and node.children:
-                servers.append(parse_server(node, warnings))
-
-    return servers, upstreams
-
-# FIXED: invalid/default server name handling
-def primary_server_name(srv: NginxServer) -> str:
-    chosen = first_valid_non_wildcard_name(srv.server_names)
-    if chosen:
-        return chosen
-
-    chosen = first_valid_name(srv.server_names)
-    if chosen:
-        return chosen
-
-    if srv.default_server_like or not srv.server_names or any(is_invalid_server_name(n) for n in srv.server_names):
-        return "default"
-
-    stem = Path(srv.file).name
-    if stem.endswith(".conf"):
-        stem = stem[:-5]
-    return stem or "migrated-site"
-
-def infer_php_app(fastcgi_pass: str) -> PhpApp:
-    val = fastcgi_pass.strip()
-    version = None
-
-    m = re.search(r"php\s*([0-9]+)\.([0-9]+)", val)
-    if m:
-        version = f"{m.group(1)}{m.group(2)}"
-    else:
-        m = re.search(r"php([0-9]{2,3})", val)
-        if m:
-            version = m.group(1)
-
-    if version:
-        name = f"lsphp{version}"
-        binary = f"/usr/local/lsws/{name}/bin/lsphp"
-        uds = f"uds://tmp/lshttpd/{name}.sock"
-    else:
-        name = "lsphp"
-        binary = "/usr/local/lsws/lsphp/bin/lsphp"
-        uds = "uds://tmp/lshttpd/lsphp.sock"
-
-    return PhpApp(name=name, binary_path=binary, uds_address=uds)
-
-def merge_servers_to_sites(servers: List[NginxServer], warnings: List[WarningItem]) -> List[Site]:
-    grouped: Dict[str, List[NginxServer]] = {}
-    for srv in servers:
-        grouped.setdefault(primary_server_name(srv), []).append(srv)
-
-    used_names: Set[str] = set()
-    sites: List[Site] = []
-
-    for key, members in grouped.items():
-        site = Site()
-        site.vhost_name = ensure_unique_name(key, used_names)
-
-        names_seen: List[str] = []
-        warned_invalid_names: Set[str] = set()
-        loc_signatures: Set[Tuple[str, str, str, str, str, str, str, str, str]] = set()
-        php_apps_seen: Dict[str, str] = {}
-        hdrs: List[str] = []
-
-        for srv in members:
-            site.source_files.add(srv.file)
-
-            if srv.enable_expires:
-                site.enable_expires = True
-            if srv.enable_stapling:
-                site.enable_stapling = True
-
-            for sn in srv.server_names:
-                if sn not in names_seen:
-                    names_seen.append(sn)
-                if is_invalid_server_name(sn) and sn not in warned_invalid_names:
-                    warned_invalid_names.add(sn)
-                    warn(
-                        warnings,
-                        f"Invalid/special nginx server_name '{sn}' treated as default-style mapping.",
-                        file=srv.file,
-                        line=srv.line,
-                        site=site.vhost_name
-                    )
-
-            site.listen_specs |= srv.listen_specs
-
-            if srv.root and not site.root:
-                site.root = srv.root
-            elif srv.root and site.root and srv.root != site.root:
-                warn(warnings,
-                     f"Conflicting roots for merged site '{site.vhost_name}': '{site.root}' vs '{srv.root}'. Using first one.",
-                     file=srv.file, line=srv.line, site=site.vhost_name)
-
-            if srv.index_files and not site.index_files:
-                site.index_files = srv.index_files[:]
-            elif srv.index_files and site.index_files and srv.index_files != site.index_files:
-                warn(warnings,
-                     f"Conflicting index files for merged site '{site.vhost_name}'. Using first set.",
-                     file=srv.file, line=srv.line, site=site.vhost_name)
-
-            if srv.try_files and not site.try_files:
-                site.try_files = srv.try_files[:]
-
-            if srv.access_log and not site.access_log:
-                site.access_log = srv.access_log
-
-            if srv.ssl_cert and not site.ssl_cert:
-                site.ssl_cert = srv.ssl_cert
-            elif srv.ssl_cert and site.ssl_cert and srv.ssl_cert != site.ssl_cert:
-                warn(warnings,
-                     f"Conflicting ssl_certificate values for '{site.vhost_name}'. Using first one.",
-                     file=srv.file, line=srv.line, site=site.vhost_name)
-
-            if srv.ssl_key and not site.ssl_key:
-                site.ssl_key = srv.ssl_key
-            elif srv.ssl_key and site.ssl_key and srv.ssl_key != site.ssl_key:
-                warn(warnings,
-                     f"Conflicting ssl_certificate_key values for '{site.vhost_name}'. Using first one.",
-                     file=srv.file, line=srv.line, site=site.vhost_name)
-
-            if srv.ssl_trusted_cert and not site.ssl_trusted_cert:
-                site.ssl_trusted_cert = srv.ssl_trusted_cert
-
-            hdrs.extend(srv.add_headers)
-
-            for loc in srv.locations:
-                sig = (
-                    loc.modifier, loc.path,
-                    loc.root or "", loc.alias or "",
-                    loc.proxy_pass or "", loc.fastcgi_pass or "",
-                    "|".join(loc.add_headers), loc.expires or "",
-                    "deny" if loc.deny_all else ""
-                )
-                if sig not in loc_signatures:
-                    loc_signatures.add(sig)
-                    site.locations.append(loc)
-
-                php_like = (
-                    bool(loc.fastcgi_pass) and
-                    loc.modifier in ("~", "~*") and
-                    bool(re.search(r"\\\.php\$|\.php\$|php", loc.path))
-                )
-                if php_like:
-                    app = infer_php_app(loc.fastcgi_pass or "")
-                    php_apps_seen[app.name] = loc.fastcgi_pass or ""
-
-        site.server_names = names_seen
-
-        if php_apps_seen:
-            if len(php_apps_seen) > 1:
-                warn(warnings,
-                     f"Multiple PHP backends detected for '{site.vhost_name}'. Using the first one.",
-                     site=site.vhost_name)
-            app_name = list(php_apps_seen.keys())[0]
-            site.php_app = app_name
-            site.php_socket_source = php_apps_seen[app_name]
-
-        if not site.root:
-            site.root = DEFAULT_DOCROOT
-            warn(warnings,
-                 f"No root found for '{site.vhost_name}'. Falling back to {DEFAULT_DOCROOT}.",
-                 site=site.vhost_name)
-
-        if not site.index_files:
-            site.index_files = DEFAULT_INDEX_PHP[:] if site.php_app else DEFAULT_INDEX_HTML[:]
-
-        site.add_headers = unique_preserve(hdrs)
-        sites.append(site)
-
-    return sites
-
-def normalize_index_files(vals: List[str]) -> List[str]:
-    out = []
-    seen = set()
-    for v in vals:
-        v = v.strip()
-        if v and v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
-
-def nginx_try_files_to_ols_rules(try_files: List[str], warnings: List[WarningItem], site: Site) -> List[str]:
-    if not try_files or len(try_files) < 2:
-        return []
-
-    fallback = try_files[-1].strip()
-
-    if fallback.startswith("="):
-        warn(warnings,
-             f"try_files fallback '{fallback}' for '{site.vhost_name}' is not directly converted.",
-             site=site.vhost_name)
-        return []
-
-    if not fallback.startswith("/"):
-        warn(warnings,
-             f"Only path-based try_files fallback is converted. Got '{fallback}' for '{site.vhost_name}'.",
-             site=site.vhost_name)
-        return []
-
-    target = fallback
-    flags = "L"
-
-    if "?" in fallback:
-        path, query = fallback.split("?", 1)
-        target = path
-        if query in ("$args", "$query_string", "") or "$args" in query or "$query_string" in query:
-            flags = "QSA,L"
+    for n in raw:
+        if n.startswith("*."):
+            wildcard.append(n)
+        elif is_invalid_server_name(n):
+            invalid.append(n)
         else:
-            flags = "QSA,L"
-            warn(warnings,
-                 f"Complex try_files query part '{query}' for '{site.vhost_name}' converted best-effort.",
-                 site=site.vhost_name)
+            valid.append(n)
 
-    return [
-        "RewriteCond %{REQUEST_FILENAME} !-f",
-        "RewriteCond %{REQUEST_FILENAME} !-d",
-        f"RewriteRule ^(.*)$ {target} [{flags}]",
-    ]
+    for n in invalid:
+        add_warning(warnings, f"Invalid/default-like server_name '{n}' treated as default/ignored", source=source, line=line)
 
-def is_same_path(a: Optional[str], b: Optional[str]) -> bool:
-    if not a or not b:
-        return False
-    return os.path.normpath(a) == os.path.normpath(b)
+    primary = first_non_wildcard_name(valid)
+    aliases = []
 
-def path_join_uri_root(root: str, uri_path: str) -> str:
-    uri_part = uri_path.lstrip("/")
-    return os.path.normpath(os.path.join(root, uri_part))
+    if primary:
+        aliases = [x for x in valid if x != primary] + wildcard
+        return primary, dedupe_preserve(aliases)
 
-def resolve_proxy_pass(proxy_pass: str,
-                       upstreams: Dict[str, NginxUpstream],
-                       warnings: List[WarningItem],
-                       site: Site,
-                       loc: NginxLocation) -> Optional[ProxyApp]:
-    val = proxy_pass.strip()
+    if wildcard:
+        aliases = wildcard[:]
+        return "default", dedupe_preserve(aliases)
 
-    if "$" in val:
-        warn(warnings,
-             f"Variable-based proxy_pass '{val}' is not supported automatically.",
-             file=loc.file, line=loc.line, site=site.vhost_name)
-        return None
+    if any(l.default_server for l in listens):
+        return "default", []
 
-    if val.startswith("http://") or val.startswith("https://"):
-        parsed = urlparse(val)
+    return "default", []
 
-        if parsed.scheme == "https":
-            warn(warnings,
-                 f"https upstream '{val}' for '{site.vhost_name}' needs manual review.",
-                 file=loc.file, line=loc.line, site=site.vhost_name)
+def promote_server_root_index(server: NginxServer, warnings: List[WarningEntry]):
+    for loc in server.locations:
+        if loc.path == "/" and loc.match_type in ("prefix", "prefix_no_regex", "exact"):
+            if not server.root and loc.root:
+                server.root = loc.root
+            if not server.index and loc.index:
+                server.index = loc.index[:]
+            if loc.expires:
+                server.enable_expires = True
 
-        host = parsed.hostname
-        port = parsed.port
-        path = parsed.path or ""
+    if path_has_scheme(server.root):
+        add_warning(
+            warnings,
+            f"Suspicious root path contains '://': {server.root}",
+            source=server.source,
+            line=server.line,
+            site=server.primary_host,
+        )
 
-        if host in upstreams:
-            up = upstreams[host]
-            if not up.servers:
-                warn(warnings,
-                     f"Upstream '{host}' has no backend servers.",
-                     file=loc.file, line=loc.line, site=site.vhost_name)
-                return None
-
-            if len(up.servers) > 1:
-                warn(warnings,
-                     f"Upstream '{host}' has multiple backends; only the first one will be used.",
-                     file=up.file, line=up.line, site=site.vhost_name)
-
-            first = up.servers[0]
-            if first.startswith("unix:"):
-                warn(warnings,
-                     f"Unix-socket upstream '{host}' is not converted automatically.",
-                     file=up.file, line=up.line, site=site.vhost_name)
-                return None
-
-            addr = first
-            if "/" in addr:
-                addr = addr.split("/", 1)[0]
-
-            name = sanitize_name(f"proxy_{host}")
-            return ProxyApp(name=name, address=addr)
-
-        if host and port:
-            if path not in ("", "/"):
-                warn(warnings,
-                     f"proxy_pass path '{val}' is simplified to backend '{host}:{port}'. Review manually.",
-                     file=loc.file, line=loc.line, site=site.vhost_name)
-            name = sanitize_name(f"proxy_{host}_{port}")
-            return ProxyApp(name=name, address=f"{host}:{port}")
-
-        if host and not port:
-            default_port = 443 if parsed.scheme == "https" else 80
-            name = sanitize_name(f"proxy_{host}_{default_port}")
-            return ProxyApp(name=name, address=f"{host}:{default_port}")
-
-    warn(warnings,
-         f"Unsupported proxy_pass '{val}'. Review manually.",
-         file=loc.file, line=loc.line, site=site.vhost_name)
+def infer_server_php_app(server: NginxServer, upstreams: Dict[str, List[str]]) -> Optional[str]:
+    for loc in server.locations:
+        if loc.fastcgi_pass:
+            app = infer_lsphp_app(loc.fastcgi_pass, upstreams)
+            if app:
+                return app
     return None
 
-def render_rewrite_block(enable_htaccess: bool, rules: List[str]) -> str:
+def parse_server(node: Node, upstreams: Dict[str, List[str]], warnings: List[WarningEntry]) -> NginxServer:
+    server = NginxServer(source=node.source, line=node.line)
+
+    for ch in node.children:
+        if ch.name == "location" and ch.children:
+            server.locations.append(parse_location(ch, upstreams, warnings))
+            continue
+
+        if ch.name == "server_name" and ch.args:
+            server.raw_server_names.extend(ch.args[:])
+            continue
+
+        if ch.name == "listen" and ch.args:
+            server.listens.append(parse_listen(ch.args))
+            continue
+
+        if ch.name == "root" and ch.args and not server.root:
+            server.root = " ".join(ch.args)
+            continue
+
+        if ch.name == "index" and ch.args and not server.index:
+            server.index = ch.args[:]
+            continue
+
+        if ch.name == "access_log" and ch.args and not server.access_log and ch.args[0] != "off":
+            server.access_log = ch.args[0]
+            continue
+
+        if ch.name == "error_log" and ch.args and not server.error_log and ch.args[0] != "off":
+            server.error_log = ch.args[0]
+            continue
+
+        if ch.name == "ssl_certificate" and ch.args and not server.ssl_cert:
+            server.ssl_cert = ch.args[0]
+            continue
+
+        if ch.name == "ssl_certificate_key" and ch.args and not server.ssl_key:
+            server.ssl_key = ch.args[0]
+            continue
+
+        if ch.name == "ssl_trusted_certificate" and ch.args and not server.ssl_trusted_cert:
+            server.ssl_trusted_cert = ch.args[0]
+            continue
+
+        if ch.name in ("ssl_stapling", "ssl_stapling_verify") and ch.args:
+            if ch.args[0].lower() == "on":
+                server.ssl_stapling = True
+            continue
+
+        if ch.name == "expires" and ch.args:
+            server.enable_expires = True
+            continue
+
+        if ch.name == "error_page":
+            add_warning(warnings, f"Unsupported nginx error_page skipped: {' '.join(ch.args)}", source=ch.source, line=ch.line)
+            continue
+
+        if ch.name == "if":
+            add_warning(warnings, "Unsupported nginx 'if' inside server; skipped", source=ch.source, line=ch.line)
+            continue
+
+        if ch.name == "add_header" and ch.args:
+            header_line = " ".join(ch.args)
+            if "$" in header_line:
+                add_warning(warnings, f"Variable-based add_header skipped: {header_line}", source=ch.source, line=ch.line)
+            continue
+
+        if ch.name == "more_set_headers" and ch.args:
+            header_line = " ".join(ch.args)
+            if "$" in header_line:
+                add_warning(warnings, f"Variable-based more_set_headers skipped: {header_line}", source=ch.source, line=ch.line)
+            continue
+
+    if not server.listens:
+        server.listens = [ListenSpec(port=80, secure=False, default_server=False)]
+
+    if (server.ssl_cert or server.ssl_key) and any(l.port == 443 for l in server.listens):
+        new_listens = []
+        for l in server.listens:
+            if l.port == 443:
+                new_listens.append(ListenSpec(port=l.port, secure=True, default_server=l.default_server))
+            else:
+                new_listens.append(l)
+        server.listens = new_listens
+
+    primary, aliases = choose_server_identity(server.raw_server_names, server.listens, warnings, node.source, node.line)
+    server.primary_host = primary
+    server.aliases = aliases
+    promote_server_root_index(server, warnings)
+    server.php_app = infer_server_php_app(server, upstreams)
+
+    return server
+
+def collect_servers(all_nodes: List[Node], upstreams: Dict[str, List[str]], warnings: List[WarningEntry]) -> List[NginxServer]:
+    servers = []
+    seen = set()
+
+    for node in iter_nodes(all_nodes):
+        if node.name != "server" or not node.children:
+            continue
+
+        ident = (node.source, node.line)
+        if ident in seen:
+            continue
+        seen.add(ident)
+
+        servers.append(parse_server(node, upstreams, warnings))
+
+    return servers
+
+# ============================================================
+# Site merge / location conversion
+# ============================================================
+
+def compute_context_location(site_root: str, loc: NginxLocation) -> Optional[str]:
+    if loc.alias:
+        return loc.alias
+
+    base = loc.root or site_root
+    if not base:
+        return None
+
+    if loc.path == "/":
+        return base
+
+    rel = loc.path.lstrip("/")
+    joined = str((Path(base) / rel).as_posix())
+
+    if loc.path.endswith("/"):
+        return joined.rstrip("/") + "/"
+    return joined
+
+def loc_has_deny_all(loc: NginxLocation) -> bool:
+    return any(x.lower() == "all" for x in loc.deny)
+
+def loc_specific_denies(loc: NginxLocation) -> List[str]:
+    return [x for x in loc.deny if x.lower() != "all"]
+
+def is_simple_acl_candidate(loc: NginxLocation) -> bool:
+    if loc.match_type not in ("exact", "prefix", "prefix_no_regex"):
+        return False
+    if loc.proxy_pass:
+        return False
+    if loc.try_files:
+        return False
+    if loc.return_args:
+        return False
+    if loc.rewrite_directives:
+        return False
+    if loc_specific_denies(loc):
+        return False
+    if loc_has_deny_all(loc):
+        return True
+    return False
+
+def is_inline_body_return(loc: NginxLocation) -> bool:
+    if not loc.return_args:
+        return False
+    if not loc.return_args[0].isdigit():
+        return False
+    if len(loc.return_args) < 2:
+        return False
+
+    code = safe_int(loc.return_args[0], 0)
+    target = loc.return_args[1]
+
+    if code < 200 or code >= 300:
+        return False
+
+    if target.startswith("/") or target.startswith("http://") or target.startswith("https://") or target.startswith("$scheme"):
+        return False
+
+    return True
+
+def is_simple_regex_deny_only(loc: NginxLocation) -> bool:
+    if loc.match_type != "regex":
+        return False
+    if not loc_has_deny_all(loc):
+        return False
+    if loc.allow:
+        return False
+    if loc_specific_denies(loc):
+        return False
+    if loc.proxy_pass:
+        return False
+    if loc.try_files:
+        return False
+    if loc.return_args:
+        return False
+    if loc.rewrite_directives:
+        return False
+    return True
+
+def is_simple_regex_allow_deny(loc: NginxLocation) -> bool:
+    if loc.match_type != "regex":
+        return False
+    if not loc.allow:
+        return False
+    if not loc_has_deny_all(loc):
+        return False
+    if loc_specific_denies(loc):
+        return False
+    if loc.proxy_pass:
+        return False
+    if loc.try_files:
+        return False
+    if loc.return_args:
+        return False
+    if loc.rewrite_directives:
+        return False
+    return True
+
+def is_safe_regex_for_ols_context(pattern: str) -> bool:
+    p = pattern.strip()
+    low = p.lower()
+
+    if not p:
+        return False
+
+    if p.startswith("@"):
+        return False
+
+    unsafe_fragments = [
+        "'",
+        '"',
+        "%27",
+        "%22",
+        r"\'",
+        r"\"",
+        "`",
+        r"\x",
+        r"\u",
+        r"\b",
+        r"\s",
+        r"\d",
+        r"\w",
+        "drop|insert|md5|select|union",
+        "concat(",
+        "benchmark(",
+        "sleep(",
+        "load_file",
+        "outfile",
+        "base64",
+        "globals",
+        "eval(",
+        "request_uri",
+        "query_string",
+        "cookie",
+        "$arg_",
+        "$query_string",
+        "$request_uri",
+        "../",
+        "<",
+        ">",
+    ]
+    if any(tok in low for tok in unsafe_fragments):
+        return False
+
+    # reject advanced PCRE except (?:...)
+    if re.search(r"\(\?[^:]", p):
+        return False
+
+    if "/" not in p:
+        return False
+
+    if re.search(r"[^A-Za-z0-9/_\-\.\*\+\?\^\$\(\)\[\]\{\}\|:\\]", p):
+        return False
+
+    safe_hints = (
+        "/uploads",
+        "/files",
+        "/wp-admin",
+        "/wp-includes",
+        "/xmlrpc",
+        "/.well-known",
+        "/cache",
+        "/tmp",
+        "/logs",
+        ".php",
+        ".txt",
+        ".log",
+        ".bak",
+        ".ini",
+        ".conf",
+    )
+
+    if p.startswith("^.*") or p.startswith(".*"):
+        if not any(h in low for h in safe_hints):
+            return False
+
+    return True
+
+def is_redundant_exact_or_prefix(loc: NginxLocation, site_root: Optional[str]) -> bool:
+    if loc.path == "/":
+        return False
+
+    if loc.allow or loc.deny:
+        return False
+
+    if loc.alias:
+        return False
+
+    if is_named_location_path(loc.path):
+        return False
+
+    if loc.root and site_root and normalize_space(loc.root.rstrip("/")) != normalize_space(site_root.rstrip("/")):
+        return False
+
+    if loc.return_args or loc.rewrite_directives:
+        return False
+
+    if loc.proxy_pass:
+        return False
+
+    if loc.try_files:
+        return False
+
+    return True
+
+def try_files_to_rewrite(loc: NginxLocation) -> List[str]:
+    if not loc.try_files:
+        return []
+    last = loc.try_files[-1]
+
+    if last.startswith("/index.php"):
+        flags = "L"
+        if "$args" in last or "$query_string" in last or "$is_args" in last:
+            flags = "QSA,L"
+        target = "/index.php"
+        return [
+            "RewriteCond %{REQUEST_FILENAME} !-f",
+            "RewriteCond %{REQUEST_FILENAME} !-d",
+            f"RewriteRule ^(.*)$ {target} [{flags}]",
+        ]
+    return []
+
+def normalize_regex_for_ols(pattern: str) -> str:
+    p = pattern.strip()
+    p = p.replace("(?:", "(")
+    if p.startswith("^"):
+        return p
+    return "^.*" + p
+
+def nginx_regex_to_exp(regex: str) -> str:
+    return "exp:" + normalize_regex_for_ols(regex)
+
+def rewrite_flag_to_ols(flag: str) -> str:
+    f = flag.lower()
+    if f == "permanent":
+        return "R=301,L"
+    if f == "redirect":
+        return "R=302,L"
+    if f in ("last", "break"):
+        return "L"
+    return "L"
+
+def location_regex_to_rewrite(loc: NginxLocation) -> List[str]:
+    rules = []
+    pattern = normalize_regex_for_ols(loc.path)
+
+    if loc.return_args:
+        if len(loc.return_args) >= 2 and loc.return_args[0].isdigit():
+            code = loc.return_args[0]
+            target = loc.return_args[1]
+            rules.append(f"RewriteRule {pattern} {target} [R={code},L]")
+            return rules
+        return rules
+
+    for rw in loc.rewrite_directives:
+        if len(rw) == 2:
+            replacement = rw[0]
+            flag = rewrite_flag_to_ols(rw[1])
+            rules.append(f"RewriteRule {pattern} {replacement} [{flag}]")
+        elif len(rw) >= 3:
+            src = normalize_regex_for_ols(rw[0])
+            repl = rw[1]
+            flag = rewrite_flag_to_ols(rw[2])
+            rules.append(f"RewriteRule {src} {repl} [{flag}]")
+    return rules
+
+def render_acl_context(uri: str, location: str, allow: List[str], deny_all: bool, source: str, line: int) -> ContextSpec:
+    if allow and deny_all:
+        return ContextSpec(
+            uri=uri,
+            location=location,
+            allow_browse=1,
+            allow=allow[:],
+            deny=["ALL"],
+            source=source,
+            line=line,
+        )
+
+    if deny_all:
+        return ContextSpec(
+            uri=uri,
+            location=location,
+            allow_browse=0,
+            allow=[],
+            deny=[],
+            source=source,
+            line=line,
+        )
+
+    return ContextSpec(
+        uri=uri,
+        location=location,
+        allow_browse=1,
+        allow=allow[:],
+        deny=[],
+        source=source,
+        line=line,
+    )
+
+def convert_location(site: Site, loc: NginxLocation, warnings: List[WarningEntry]):
+    if is_named_location_path(loc.path):
+        add_warning(
+            warnings,
+            f"Named location skipped as unsupported: {loc.path}",
+            source=loc.source,
+            line=loc.line,
+            site=site.name,
+        )
+        return
+
+    if loc.children:
+        add_warning(
+            warnings,
+            f"Nested location inside '{loc.path}' skipped as complex/unreliable",
+            source=loc.source,
+            line=loc.line,
+            site=site.name,
+        )
+
+    if loc.expires:
+        site.enable_expires = True
+
+    if is_inline_body_return(loc):
+        add_warning(
+            warnings,
+            f"Inline return body skipped as unsupported: {' '.join(loc.return_args)}",
+            source=loc.source,
+            line=loc.line,
+            site=site.name,
+        )
+        return
+
+    if loc.path == "/" and loc.match_type in ("prefix", "prefix_no_regex", "exact"):
+        rules = try_files_to_rewrite(loc)
+        for r in rules:
+            if r not in site.front_controller_rules:
+                site.front_controller_rules.append(r)
+        return
+
+    if is_simple_regex_deny_only(loc):
+        if not is_safe_regex_for_ols_context(loc.path):
+            add_warning(
+                warnings,
+                f"Regex deny location skipped as unsafe/too complex for OLS context: {loc.path}",
+                source=loc.source,
+                line=loc.line,
+                site=site.name,
+            )
+            return
+
+        if loc.regex_case_insensitive:
+            add_warning(
+                warnings,
+                f"Case-insensitive nginx regex (~*) converted approximately to OLS exp context: {loc.path}",
+                source=loc.source,
+                line=loc.line,
+                site=site.name,
+            )
+
+        site.contexts.append(
+            ContextSpec(
+                uri=nginx_regex_to_exp(loc.path),
+                location="$DOC_ROOT/$0",
+                allow_browse=0,
+                source=loc.source,
+                line=loc.line,
+            )
+        )
+        return
+
+    if is_simple_regex_allow_deny(loc):
+        if not is_safe_regex_for_ols_context(loc.path):
+            add_warning(
+                warnings,
+                f"Regex ACL location skipped as unsafe/too complex for OLS context: {loc.path}",
+                source=loc.source,
+                line=loc.line,
+                site=site.name,
+            )
+            return
+
+        if loc.regex_case_insensitive:
+            add_warning(
+                warnings,
+                f"Case-insensitive nginx regex (~*) converted approximately to OLS exp ACL context: {loc.path}",
+                source=loc.source,
+                line=loc.line,
+                site=site.name,
+            )
+
+        site.contexts.append(
+            ContextSpec(
+                uri=nginx_regex_to_exp(loc.path),
+                location="$DOC_ROOT/$0",
+                allow_browse=1,
+                allow=loc.allow[:],
+                deny=["ALL"],
+                source=loc.source,
+                line=loc.line,
+            )
+        )
+        return
+
+    if loc.match_type == "regex" and (loc.return_args or loc.rewrite_directives):
+        rules = location_regex_to_rewrite(loc)
+        if rules:
+            for r in rules:
+                if r not in site.rewrite_rules:
+                    site.rewrite_rules.append(r)
+            return
+
+    if loc.match_type == "regex":
+        add_warning(
+            warnings,
+            f"Regex location skipped as unsupported/complex: {loc.path}",
+            source=loc.source,
+            line=loc.line,
+            site=site.name,
+        )
+        return
+
+    if is_simple_acl_candidate(loc):
+        ctx_loc = compute_context_location(site.root or "/var/www/html", loc)
+        if ctx_loc:
+            site.contexts.append(
+                render_acl_context(
+                    uri=loc.path,
+                    location=ctx_loc,
+                    allow=loc.allow,
+                    deny_all=loc_has_deny_all(loc),
+                    source=loc.source,
+                    line=loc.line,
+                )
+            )
+            return
+
+    if loc.alias or (loc.root and site.root and normalize_space(loc.root.rstrip("/")) != normalize_space(site.root.rstrip("/"))):
+        ctx_loc = compute_context_location(site.root or "/var/www/html", loc)
+        if ctx_loc:
+            site.contexts.append(
+                ContextSpec(
+                    uri=loc.path,
+                    location=ctx_loc,
+                    allow_browse=1,
+                    source=loc.source,
+                    line=loc.line,
+                )
+            )
+            return
+
+    if loc.return_args:
+        if len(loc.return_args) >= 2 and loc.return_args[0].isdigit():
+            code = loc.return_args[0]
+            target = loc.return_args[1]
+            if target.startswith("/") or target.startswith("http://") or target.startswith("https://"):
+                pattern = "^" + re.escape(loc.path.rstrip("/")) + "/?$" if loc.path != "/" else "^/$"
+                site.rewrite_rules.append(f"RewriteRule {pattern} {target} [R={code},L]")
+                return
+            else:
+                add_warning(
+                    warnings,
+                    f"Inline/non-URL return skipped as unsupported: {' '.join(loc.return_args)}",
+                    source=loc.source,
+                    line=loc.line,
+                    site=site.name,
+                )
+                return
+
+    if loc.rewrite_directives:
+        pattern = "^" + re.escape(loc.path.rstrip("/")) + "/?$" if loc.path != "/" else "^/$"
+        for rw in loc.rewrite_directives:
+            if len(rw) == 2:
+                repl = rw[0]
+                flag = rewrite_flag_to_ols(rw[1])
+                site.rewrite_rules.append(f"RewriteRule {pattern} {repl} [{flag}]")
+                return
+            elif len(rw) >= 3:
+                src = normalize_regex_for_ols(rw[0])
+                repl = rw[1]
+                flag = rewrite_flag_to_ols(rw[2])
+                site.rewrite_rules.append(f"RewriteRule {src} {repl} [{flag}]")
+                return
+
+    if loc.proxy_pass:
+        add_warning(
+            warnings,
+            f"proxy_pass not converted for location '{loc.path}'; skipped",
+            source=loc.source,
+            line=loc.line,
+            site=site.name,
+        )
+        return
+
+    if is_redundant_exact_or_prefix(loc, site.root):
+        return
+
+    add_warning(
+        warnings,
+        f"Location skipped as unsupported/complex: {loc.path}",
+        source=loc.source,
+        line=loc.line,
+        site=site.name,
+    )
+
+def merge_servers_to_sites(servers: List[NginxServer], warnings: List[WarningEntry]) -> List[Site]:
+    grouped: Dict[str, List[NginxServer]] = defaultdict(list)
+    for srv in servers:
+        grouped[sanitize_site_name(srv.primary_host)].append(srv)
+
+    sites: List[Site] = []
+
+    for site_name, items in grouped.items():
+        primary_host = "default"
+        aliases: List[str] = []
+        root = None
+        index: List[str] = []
+        access_log = None
+        error_log = None
+        listens: List[ListenSpec] = []
+        ssl_cert = None
+        ssl_key = None
+        ssl_trusted = None
+        ssl_stapling = False
+        php_app = None
+        enable_expires = False
+        source_refs: List[str] = []
+        all_locations: List[NginxLocation] = []
+
+        for srv in items:
+            if primary_host == "default" and srv.primary_host != "default":
+                primary_host = srv.primary_host
+
+            aliases.extend(srv.aliases)
+            root = choose_better_root(root, srv.root)
+            index = prefer_index(index, srv.index)
+            if not access_log and srv.access_log:
+                access_log = srv.access_log
+            if not error_log and srv.error_log:
+                error_log = srv.error_log
+            listens.extend(srv.listens)
+            if not ssl_cert and srv.ssl_cert:
+                ssl_cert = srv.ssl_cert
+            if not ssl_key and srv.ssl_key:
+                ssl_key = srv.ssl_key
+            if not ssl_trusted and srv.ssl_trusted_cert:
+                ssl_trusted = srv.ssl_trusted_cert
+            ssl_stapling = ssl_stapling or srv.ssl_stapling
+            if not php_app and srv.php_app:
+                php_app = srv.php_app
+            enable_expires = enable_expires or srv.enable_expires
+            source_refs.append(f"{srv.source}:{srv.line}")
+            all_locations.extend(srv.locations)
+
+        if not root:
+            root = "/var/www/html"
+            add_warning(warnings, f"Could not determine docRoot for site '{site_name}', using fallback {root}", site=site_name)
+
+        if path_has_scheme(root):
+            add_warning(warnings, f"Suspicious root path contains '://': {root}", site=site_name)
+
+        if not index:
+            index = ["index.php", "index.html", "index.htm"]
+
+        listens = dedupe_listens(listens)
+        aliases = dedupe_preserve([a for a in aliases if a and a != primary_host])
+
+        site = Site(
+            name=site_name,
+            primary_host=primary_host if primary_host else "default",
+            aliases=aliases,
+            source_refs=dedupe_preserve(source_refs),
+            root=root,
+            index=index,
+            access_log=access_log,
+            error_log=error_log,
+            listens=listens,
+            ssl_cert=ssl_cert,
+            ssl_key=ssl_key,
+            ssl_trusted_cert=ssl_trusted,
+            ssl_stapling=ssl_stapling,
+            php_app=php_app,
+            enable_expires=enable_expires,
+        )
+
+        for loc in all_locations:
+            convert_location(site, loc, warnings)
+
+        cseen = set()
+        deduped_contexts = []
+        for c in site.contexts:
+            key = (c.uri, c.location, c.allow_browse, tuple(c.allow), tuple(c.deny))
+            if key not in cseen:
+                cseen.add(key)
+                deduped_contexts.append(c)
+        site.contexts = deduped_contexts
+        site.rewrite_rules = dedupe_preserve(site.rewrite_rules)
+        site.front_controller_rules = dedupe_preserve(site.front_controller_rules)
+
+        if not site.php_app:
+            site.php_app = "lsphp"
+
+        sites.append(site)
+
+    sites.sort(key=lambda s: (s.name != "default", s.name))
+    return sites
+
+# ============================================================
+# OLS rendering
+# ============================================================
+
+def render_accesslog(path: str) -> str:
+    return (
+        f"accesslog {path} {{\n"
+        f"  useServer               0\n"
+        f"  logFormat               \"%h %l %u %t \\\"%r\\\" %>s %b\"\n"
+        f"}}\n"
+    )
+
+def render_errorlog(path: str) -> str:
+    return (
+        f"errorlog {path} {{\n"
+        f"  useServer               0\n"
+        f"  logLevel                WARN\n"
+        f"}}\n"
+    )
+
+def render_context(ctx: ContextSpec) -> str:
+    effective_allow_browse = 1 if ctx.allow else ctx.allow_browse
+
+    lines = [
+        f"context {ctx.uri} {{",
+        f"  type                    static",
+        f"  location                {ctx.location}",
+        f"  allowBrowse             {effective_allow_browse}",
+    ]
+
+    if ctx.allow or ctx.deny:
+        lines.append("  accessControl  {")
+        if ctx.allow:
+            lines.append(f"    allow                 {', '.join(ctx.allow)}")
+        for item in ctx.deny:
+            lines.append(f"    deny                  {item}")
+        lines.append("  }")
+
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+def render_rewrite_block(rules: List[str], auto_htaccess: bool) -> str:
     lines = [
         "rewrite  {",
         "  enable                  1",
-        f"  autoLoadHtaccess        {1 if enable_htaccess else 0}",
+        f"  autoLoadHtaccess        {0 if not auto_htaccess else 1}",
     ]
     if rules:
-        lines.append("  rewriteRules            <<<END_REWRITE_RULES")
+        lines.append("  rules                   <<<END_rules")
         lines.extend(rules)
-        lines.append("END_REWRITE_RULES")
+        lines.append("END_rules")
     lines.append("}")
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n"
 
-def render_index_block(index_files: List[str]) -> str:
-    idx = " ".join(normalize_index_files(index_files))
-    return "\n".join([
-        "index  {",
-        "  useServer               0",
-        f"  indexFiles              {idx}",
-        "}",
-    ])
-
-def render_accesslog_block(path: str) -> str:
-    return "\n".join([
-        f"accesslog {path} {{",
-        "  useServer               0",
-        "  logFormat               \"%h %l %u %t \\\"%r\\\" %>s %b\"",
-        "  rollingSize             10M",
-        "  keepDays                30",
-        "  compressArchive         1",
-        "}",
-    ])
-
-def render_vhssl_block(site: Site, warnings: List[WarningItem]) -> str:
-    if site.ssl_cert and site.ssl_key:
-        lines = [
-            "vhssl  {",
-            f"  keyFile                 {site.ssl_key}",
-            f"  certFile                {site.ssl_cert}",
-            "  certChain               1",
-        ]
-        if site.enable_stapling:
-            lines.append("  enableStapling          1")
-        lines.append("}")
-        return "\n".join(lines)
-
-    secure_ports = [p for p, s in site.listen_specs if s]
-    if secure_ports:
-        warn(warnings,
-             f"Site '{site.vhost_name}' listens on secure port(s) {secure_ports} but cert/key is incomplete.",
-             site=site.vhost_name)
-    return ""
-
-def render_scripthandler_block(site: Site) -> str:
-    if not site.php_app:
+def render_vhssl(site: Site) -> str:
+    if not site.ssl_cert or not site.ssl_key:
         return ""
-    return "\n".join([
-        "scripthandler  {",
-        f"  add                     lsapi:{site.php_app} php",
-        "}",
-    ])
-
-def render_extra_headers(headers: List[str]) -> str:
-    headers = unique_preserve(headers)
-    if not headers:
-        return ""
-    lines = ["  extraHeaders            <<<END_extraHeaders"]
-    lines.extend(headers)
-    lines.append("END_extraHeaders")
-    return "\n".join(lines)
-
-def build_root_context(site: Site, root_loc: Optional[NginxLocation], headers: List[str]) -> Optional[str]:
-    headers = unique_preserve(headers)
-    if not headers and not root_loc:
-        return None
-
-    if root_loc and root_loc.alias:
-        location = root_loc.alias
-        if not location.endswith("/"):
-            location += "/"
-    elif root_loc and root_loc.root and not is_same_path(root_loc.root, site.root):
-        location = root_loc.root
-        if not location.endswith("/"):
-            location += "/"
-    else:
-        location = "$DOC_ROOT/"
-
-    parts = [
-        "context / {",
-        "  type                    static",
-        f"  location                {location}",
-        "  allowBrowse             1",
+    lines = [
+        "vhssl  {",
+        f"  keyFile                 {site.ssl_key}",
+        f"  certFile                {site.ssl_cert}",
+        "  certChain               1",
     ]
+    if site.ssl_stapling:
+        lines.append("  enableStapling          1")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
 
-    hdr = render_extra_headers(headers)
-    if hdr:
-        parts.append(hdr)
-
-    parts.append("}")
-    return "\n".join(parts)
-
-def build_static_context(site: Site, loc: NginxLocation) -> Optional[str]:
-    if loc.modifier in ("~", "~*"):
-        return None
-    if loc.deny_all:
-        return None
-    if not (loc.root or loc.alias or loc.add_headers):
-        return None
-
-    uri = loc.path or "/"
-    if not uri.startswith("/"):
-        return None
-
-    if loc.alias:
-        target = loc.alias
-        if uri.endswith("/") and not target.endswith("/"):
-            target += "/"
-    elif loc.root:
-        if uri == "/" and is_same_path(loc.root, site.root) and not loc.add_headers:
-            return None
-        if uri.endswith("/"):
-            target = path_join_uri_root(loc.root, uri)
-            if not target.endswith("/"):
-                target += "/"
-        else:
-            target = path_join_uri_root(loc.root, uri)
-    else:
-        target = "$DOC_ROOT/" if uri == "/" else f"$DOC_ROOT{uri}"
-
-    parts = [
-        f"context {uri} {{",
-        "  type                    static",
-        f"  location                {target}",
-        f"  allowBrowse             {1 if uri.endswith('/') else 0}",
-    ]
-
-    hdr = render_extra_headers(loc.add_headers)
-    if hdr:
-        parts.append(hdr)
-
-    parts.append("}")
-    return "\n".join(parts)
-
-def build_deny_context(site: Site, loc: NginxLocation) -> Optional[str]:
-    if not loc.deny_all:
-        return None
-    if loc.modifier != "=":
-        return None
-    uri = loc.path.strip()
-    if not uri.startswith("/"):
-        return None
-
-    if loc.alias:
-        target = loc.alias
-    elif loc.root:
-        target = path_join_uri_root(loc.root, uri)
-    else:
-        target = f"$DOC_ROOT{uri}"
-
-    return "\n".join([
-        f"context {uri} {{",
-        "  type                    static",
-        f"  location                {target}",
-        "  accessible              0",
-        "  allowBrowse             0",
-        "}",
-    ])
-
-def build_proxy_context(loc: NginxLocation, proxy_app: ProxyApp) -> str:
-    uri = loc.path or "/"
-    parts = [
-        f"context {uri} {{",
-        "  type                    proxy",
-        f"  handler                 {proxy_app.name}",
-        "  addDefaultCharset       off",
-    ]
-    hdr = render_extra_headers(loc.add_headers)
-    if hdr:
-        parts.append(hdr)
-    parts.append("}")
-    return "\n".join(parts)
-
-def render_site_vhconf(site: Site,
-                       upstreams: Dict[str, NginxUpstream],
-                       warnings: List[WarningItem],
-                       enable_htaccess: bool) -> Tuple[str, Dict[str, PhpApp], Dict[str, ProxyApp]]:
-    php_apps: Dict[str, PhpApp] = {}
-    proxy_apps: Dict[str, ProxyApp] = {}
-
-    if site.php_app and site.php_socket_source:
-        php = infer_php_app(site.php_socket_source)
-        php_apps[php.name] = php
-
-    rewrite_rules: List[str] = []
-    if site.try_files:
-        rewrite_rules.extend(nginx_try_files_to_ols_rules(site.try_files, warnings, site))
-
-    root_loc = None
-    for loc in site.locations:
-        if loc.path == "/" and loc.modifier in ("", "^~"):
-            root_loc = loc
-            break
-
-    root_headers = site.add_headers[:]
-    if root_loc:
-        root_headers.extend(root_loc.add_headers)
-    root_headers = unique_preserve(root_headers)
-
-    contexts: List[str] = []
-    seen_contexts: Set[str] = set()
-
-    root_ctx = build_root_context(site, root_loc, root_headers)
-    if root_ctx:
-        contexts.append(root_ctx)
-        seen_contexts.add(root_ctx)
-
-    for loc in site.locations:
-        php_like = (
-            bool(loc.fastcgi_pass) and
-            loc.modifier in ("~", "~*") and
-            bool(re.search(r"\\\.php\$|\.php\$|php", loc.path))
-        )
-        if php_like:
-            continue
-
-        if loc.try_files and loc.path != "/":
-            warn(warnings,
-                 f"try_files inside location '{loc.path}' for '{site.vhost_name}' is not fully converted.",
-                 file=loc.file, line=loc.line, site=site.vhost_name)
-
-        deny_ctx = build_deny_context(site, loc)
-        if deny_ctx and deny_ctx not in seen_contexts:
-            contexts.append(deny_ctx)
-            seen_contexts.add(deny_ctx)
-            continue
-
-        if loc.proxy_pass:
-            app = resolve_proxy_pass(loc.proxy_pass, upstreams, warnings, site, loc)
-            if app:
-                proxy_apps[app.name] = app
-                ctx = build_proxy_context(loc, app)
-                if ctx not in seen_contexts:
-                    contexts.append(ctx)
-                    seen_contexts.add(ctx)
-            continue
-
-        if loc.fastcgi_pass and not php_like:
-            warn(warnings,
-                 f"Non-standard fastcgi location '{loc.path}' for '{site.vhost_name}' needs manual review.",
-                 file=loc.file, line=loc.line, site=site.vhost_name)
-            continue
-
-        if loc.path == "/" and loc.modifier in ("", "^~"):
-            continue
-
-        static_ctx = build_static_context(site, loc)
-        if static_ctx and static_ctx not in seen_contexts:
-            contexts.append(static_ctx)
-            seen_contexts.add(static_ctx)
-
-    docroot = site.root or DEFAULT_DOCROOT
-    index_files = normalize_index_files(site.index_files or DEFAULT_INDEX_HTML)
-    accesslog_path = site.access_log or "$VH_ROOT/logs/access.log"
-
-    parts = []
-    parts.append(f"docRoot                   {docroot}")
-    parts.append("")
-
-    if site.enable_expires:
-        parts.append("enableExpires            1")
-        parts.append("")
-
-    parts.append(render_accesslog_block(accesslog_path))
-    parts.append("")
-    parts.append(render_index_block(index_files))
-    parts.append("")
-
-    sh = render_scripthandler_block(site)
-    if sh:
-        parts.append(sh)
-        parts.append("")
-
-    for ctx in contexts:
-        parts.append(ctx)
-        parts.append("")
-
-    parts.append(render_rewrite_block(enable_htaccess=enable_htaccess, rules=rewrite_rules))
-    parts.append("")
-
-    ssl_block = render_vhssl_block(site, warnings)
-    if ssl_block:
-        parts.append(ssl_block)
-        parts.append("")
-
-    text = "\n".join(parts).rstrip() + "\n"
-    return text, php_apps, proxy_apps
-
-def render_php_extprocessor(app: PhpApp) -> str:
-    return "\n".join([
-        f"extprocessor {app.name} {{",
-        "  type                    lsapi",
-        f"  address                 {app.uds_address}",
-        "  maxConns                35",
-        "  env                     PHP_LSAPI_CHILDREN=35",
-        "  initTimeout             60",
-        "  retryTimeout            0",
-        "  persistConn             1",
-        "  respBuffer              0",
-        "  autoStart               2",
-        f"  path                    {app.binary_path}",
-        "  backlog                 100",
-        "  instances               1",
-        "  extUser                 nobody",
-        "  extGroup                nobody",
-        "  runOnStartUp            3",
-        "  priority                0",
-        "  memSoftLimit            2047M",
-        "  memHardLimit            2047M",
-        "  procSoftLimit           1400",
-        "  procHardLimit           1500",
-        "}",
-    ])
-
-def render_proxy_extprocessor(app: ProxyApp) -> str:
-    return "\n".join([
-        f"extprocessor {app.name} {{",
-        "  type                    webserver",
-        f"  address                 {app.address}",
-        "  maxConns                100",
-        "  initTimeout             60",
-        "  retryTimeout            0",
-        "  persistConn             1",
-        "  respBuffer              0",
-        "}",
-    ])
-
-def render_virtualhost_block(site: Site, ols_vhosts_root: Path) -> str:
-    vh_root = (ols_vhosts_root / site.vhost_name).as_posix().rstrip("/") + "/"
-    vh_conf = (ols_vhosts_root / site.vhost_name / "vhconf.conf").as_posix()
-
-    return "\n".join([
-        f"virtualhost {site.vhost_name} {{",
-        f"  vhRoot                  {vh_root}",
-        f"  configFile              {vh_conf}",
-        "  allowSymbolLink         1",
-        "  enableScript            1",
-        "  restrained              1",
-        "  setUIDMode              0",
-        "}",
-    ])
-
-def strip_managed_block(text: str, begin_marker: str, end_marker: str) -> str:
-    pattern = re.compile(re.escape(begin_marker) + r".*?" + re.escape(end_marker), re.S)
-    return pattern.sub("", text)
-
-def strip_all_managed_sections(text: str) -> str:
-    text = strip_managed_block(text, GLOBAL_BEGIN_LISTENERS, GLOBAL_END_LISTENERS)
-    text = strip_managed_block(text, GLOBAL_BEGIN_VHOSTS, GLOBAL_END_VHOSTS)
-    text = strip_managed_block(text, GLOBAL_BEGIN_EXTPROC, GLOBAL_END_EXTPROC)
-    text = strip_managed_block(text, INNER_BEGIN_MAPS, INNER_END_MAPS)
-    return text
-
-def find_matching_brace(text: str, open_brace_idx: int) -> int:
-    depth = 0
-    i = open_brace_idx
-    in_quote = None
-    n = len(text)
-
-    while i < n:
-        ch = text[i]
-        if in_quote:
-            if ch == "\\" and i + 1 < n:
-                i += 2
-                continue
-            if ch == in_quote:
-                in_quote = None
-            i += 1
-            continue
-
-        if ch in ("'", '"'):
-            in_quote = ch
-            i += 1
-            continue
-
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
-
-    raise ValueError("Unmatched brace in OLS config.")
-
-def parse_ols_existing_listeners(httpd_text: str) -> List[ExistingListener]:
-    listeners: List[ExistingListener] = []
-
-    for m in re.finditer(r'(^|\n)\s*listener\s+([^\s{]+)\s*\{', httpd_text):
-        name = m.group(2)
-        brace_idx = httpd_text.find("{", m.start())
-        if brace_idx == -1:
-            continue
-        try:
-            end_idx = find_matching_brace(httpd_text, brace_idx)
-        except ValueError:
-            continue
-
-        block_text = httpd_text[m.start():end_idx + 1]
-        body = httpd_text[brace_idx + 1:end_idx]
-
-        port = None
-        secure = False
-
-        addr_match = re.search(r'^\s*address\s+([^\n]+)$', body, flags=re.M)
-        if addr_match:
-            addr = addr_match.group(1).strip()
-            pm = re.search(r':(\d+)\s*$', addr)
-            if pm:
-                port = int(pm.group(1))
-
-        sec_match = re.search(r'^\s*secure\s+([01])\s*$', body, flags=re.M)
-        if sec_match:
-            secure = sec_match.group(1) == "1"
-
-        listeners.append(ExistingListener(
-            name=name,
-            start=m.start(),
-            end=end_idx + 1,
-            text=block_text,
-            port=port,
-            secure=secure,
-        ))
-
-    return listeners
-
-def inject_maps_into_listener_block(block_text: str, map_lines: List[str]) -> str:
-    block_text = strip_managed_block(block_text, INNER_BEGIN_MAPS, INNER_END_MAPS).rstrip()
-
-    if not map_lines:
-        return block_text + "\n"
-
-    marker = "\n".join(
-        ["  " + INNER_BEGIN_MAPS] +
-        [f"  {line}" for line in map_lines] +
-        ["  " + INNER_END_MAPS]
+def render_scripthandler(site: Site) -> str:
+    app = site.php_app or "lsphp"
+    return (
+        "scripthandler  {\n"
+        f"  add                     lsapi:{app} php\n"
+        "}\n"
     )
 
-    close_idx = block_text.rfind("}")
-    if close_idx == -1:
-        return block_text + "\n" + marker + "\n"
+def render_site_vhconf(site: Site, auto_htaccess: bool = True) -> str:
+    parts = []
 
-    before = block_text[:close_idx].rstrip()
-    after = block_text[close_idx:]
-    return before + "\n" + marker + "\n" + after + ("\n" if not after.endswith("\n") else "")
+    parts.append(f"docRoot                   {site.root}\n")
 
-def replace_listener_blocks(httpd_text: str, replacements: List[Tuple[int, int, str]]) -> str:
-    out = httpd_text
-    for start, end, new_text in sorted(replacements, key=lambda x: x[0], reverse=True):
-        out = out[:start] + new_text + out[end:]
-    return out
+    if site.enable_expires:
+        parts.append("enableExpires             1\n")
 
-def render_listener_block(name: str,
-                          port: int,
-                          secure: bool,
-                          map_lines: List[str]) -> str:
+    parts.append(
+        "index  {\n"
+        "  useServer               0\n"
+        f"  indexFiles              {', '.join(site.index)}\n"
+        "}\n"
+    )
+
+    if site.access_log:
+        parts.append(render_accesslog(site.access_log))
+
+    if site.error_log:
+        parts.append(render_errorlog(site.error_log))
+
+    for c in site.contexts:
+        parts.append(render_context(c))
+
+    all_rewrite_rules = site.rewrite_rules + site.front_controller_rules
+    parts.append(render_rewrite_block(all_rewrite_rules, auto_htaccess))
+    parts.append(render_scripthandler(site))
+
+    ssl_block = render_vhssl(site)
+    if ssl_block:
+        parts.append(ssl_block)
+
+    return "\n".join(p.rstrip() for p in parts if p).rstrip() + "\n"
+
+def render_php_extprocessor(app: str) -> str:
+    app = app or "lsphp"
+    php_bin = f"/usr/local/lsws/{app}/bin/lsphp"
+    if app == "lsphp":
+        php_bin = "/usr/local/lsws/lsphp/bin/lsphp"
+
+    return (
+        f"extprocessor {app} {{\n"
+        f"  type                    lsapi\n"
+        f"  address                 uds://tmp/lshttpd/{app}.sock\n"
+        f"  maxConns                35\n"
+        f"  env                     PHP_LSAPI_CHILDREN=35\n"
+        f"  initTimeout             60\n"
+        f"  retryTimeout            0\n"
+        f"  persistConn             1\n"
+        f"  pcKeepAliveTimeout      1\n"
+        f"  respBuffer              0\n"
+        f"  autoStart               1\n"
+        f"  path                    {php_bin}\n"
+        f"  backlog                 100\n"
+        f"  instances               1\n"
+        f"  extMaxIdleTime          300\n"
+        f"  priority                0\n"
+        f"  memSoftLimit            2047M\n"
+        f"  memHardLimit            2047M\n"
+        f"  procSoftLimit           1400\n"
+        f"  procHardLimit           1500\n"
+        f"}}\n"
+    )
+
+def map_hosts_for_site(site: Site) -> str:
+    hosts = []
+    if site.primary_host and site.primary_host != "default":
+        hosts.append(site.primary_host)
+    hosts.extend(site.aliases)
+    hosts = dedupe_preserve([h for h in hosts if h])
+
+    if not hosts:
+        hosts = ["default"]
+
+    return ", ".join(hosts)
+
+def render_map_line(site: Site) -> str:
+    return f"map                     {site.name} {map_hosts_for_site(site)}"
+
+def render_virtualhost_block(site: Site, vhosts_root: Path) -> str:
+    vh_root = (vhosts_root / site.name).as_posix()
+    conf_file = (vhosts_root / site.name / "vhconf.conf").as_posix()
+
+    return (
+        f"virtualhost {site.name} {{\n"
+        f"  vhRoot                  {vh_root}/\n"
+        f"  configFile              {conf_file}\n"
+        f"  allowSymbolLink         1\n"
+        f"  enableScript            1\n"
+        f"  restrained              1\n"
+        f"  setUIDMode              2\n"
+        f"}}\n"
+    )
+
+def render_listener_block(name: str, port: int, secure: bool, map_lines: List[str]) -> str:
     lines = [
         f"listener {name} {{",
         f"  address                 *:{port}",
         f"  secure                  {1 if secure else 0}",
     ]
-
     if secure:
-        # FIXED: use requested webadmin cert/key for secure listener bootstrap
-        lines.append(f"  keyFile                 {DEFAULT_OLS_WEBADMIN_KEY}")
-        lines.append(f"  certFile                {DEFAULT_OLS_WEBADMIN_CERT}")
-
-    lines.extend(map_lines)
+        lines.extend([
+            f"  keyFile                 {DEFAULT_SECURE_LISTENER_KEY}",
+            f"  certFile                {DEFAULT_SECURE_LISTENER_CERT}",
+            f"  certChain               1",
+        ])
+    lines.append(f"  {LISTENER_MAP_BEGIN}")
+    lines.extend([f"  {x}" for x in map_lines])
+    lines.append(f"  {LISTENER_MAP_END}")
     lines.append("}")
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n"
 
-def append_managed_block(text: str, begin: str, end: str, content: str) -> str:
-    block = f"\n{begin}\n{content.rstrip()}\n{end}\n"
-    return text.rstrip() + "\n" + block
+# ============================================================
+# OLS httpd patching
+# ============================================================
 
-# FIXED: correct OLS listener map direction and invalid/default domain handling
-def build_listener_map_line(site: Site) -> str:
-    domains = filter_listener_domains(site.server_names)
-    if not domains:
-        domains = ["default"]
-    rhs = ", ".join(domains)
-    return f"map                     {site.vhost_name} {rhs}"
+def find_matching_brace(text: str, open_brace_pos: int) -> int:
+    depth = 0
+    i = open_brace_pos
+    n = len(text)
+    quote = None
 
-def patch_httpd_config(orig_httpd: str,
-                       sites: List[Site],
-                       php_apps: Dict[str, PhpApp],
-                       proxy_apps: Dict[str, ProxyApp],
-                       ols_vhosts_root: Path,
-                       warnings: List[WarningItem]) -> Tuple[str, Dict[str, List[str]], Dict[str, List[str]]]:
-    clean = strip_all_managed_sections(orig_httpd)
-    existing = parse_ols_existing_listeners(clean)
+    while i < n:
+        c = text[i]
 
-    used_listener_names = {x.name for x in existing}
-    listener_by_spec: Dict[Tuple[int, bool], str] = {}
+        if quote:
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
 
-    for lst in existing:
-        if lst.port is not None:
-            listener_by_spec.setdefault((lst.port, lst.secure), lst.name)
+        if c in ("'", '"'):
+            quote = c
+            i += 1
+            continue
 
-    site_listeners: Dict[str, List[str]] = {}
-    new_listener_specs: Dict[Tuple[int, bool], str] = {}
+        if c == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
 
-    for site in sites:
-        site_listeners[site.vhost_name] = []
-        for spec in sorted(site.listen_specs):
-            port, secure = spec
-            if spec in listener_by_spec:
-                lname = listener_by_spec[spec]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+
+    return -1
+
+def parse_listener_blocks(httpd_text: str) -> List[ListenerBlockInfo]:
+    blocks: List[ListenerBlockInfo] = []
+    for m in re.finditer(r"(?m)^\s*listener\s+([A-Za-z0-9._:-]+)\s*\{", httpd_text):
+        name = m.group(1)
+        brace_pos = httpd_text.find("{", m.start())
+        end = find_matching_brace(httpd_text, brace_pos)
+        if end < 0:
+            continue
+        body = httpd_text[brace_pos + 1:end]
+
+        port = None
+        secure = False
+
+        m_addr = re.search(r"(?m)^\s*address\s+(\S+)", body)
+        if m_addr:
+            addr = m_addr.group(1)
+            m_port = re.search(r":(\d+)$", addr)
+            if m_port:
+                port = int(m_port.group(1))
+            elif re.fullmatch(r"\d+", addr):
+                port = int(addr)
+
+        m_secure = re.search(r"(?m)^\s*secure\s+(\d+)", body)
+        if m_secure:
+            secure = m_secure.group(1) == "1"
+
+        blocks.append(
+            ListenerBlockInfo(
+                name=name,
+                start=m.start(),
+                brace_pos=brace_pos,
+                end=end,
+                body=body,
+                port=port,
+                secure=secure,
+            )
+        )
+    return blocks
+
+def upsert_managed_subblock(body: str, begin_marker: str, end_marker: str, content_lines: List[str], indent: str = "  ") -> str:
+    block = []
+    block.append(f"{indent}{begin_marker}")
+    for line in content_lines:
+        block.append(f"{indent}{line}")
+    block.append(f"{indent}{end_marker}")
+    new_chunk = "\n".join(block)
+
+    pattern = re.compile(re.escape(begin_marker) + r".*?" + re.escape(end_marker), re.S)
+    if pattern.search(body):
+        return pattern.sub(new_chunk, body)
+
+    body = body.rstrip()
+    if body and not body.endswith("\n"):
+        body += "\n"
+    return body + new_chunk + "\n"
+
+def upsert_global_managed_block(text: str, block_content: str) -> str:
+    pattern = re.compile(re.escape(GLOBAL_MANAGED_BEGIN) + r".*?" + re.escape(GLOBAL_MANAGED_END), re.S)
+    wrapped = f"{GLOBAL_MANAGED_BEGIN}\n{block_content.rstrip()}\n{GLOBAL_MANAGED_END}\n"
+    if pattern.search(text):
+        return pattern.sub(wrapped, text)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + "\n" + wrapped
+
+def patch_top_level_user_group(httpd_text: str, user: Optional[str], group: Optional[str]) -> str:
+    text = httpd_text
+
+    if user:
+        text, n = re.subn(r"(?m)^\s*user\s+\S+\s*$", f"user                             {user}", text, count=1)
+        if n == 0:
+            text = f"user                             {user}\n" + text
+
+    if group:
+        text, n = re.subn(r"(?m)^\s*group\s+\S+\s*$", f"group                            {group}", text, count=1)
+        if n == 0:
+            if text.startswith("user"):
+                parts = text.splitlines(True)
+                inserted = False
+                out = []
+                for line in parts:
+                    out.append(line)
+                    if line.lstrip().startswith("user") and not inserted:
+                        out.append(f"group                            {group}\n")
+                        inserted = True
+                text = "".join(out)
             else:
-                if spec not in new_listener_specs:
-                    base = f"NginxMigrated_{port}{'_SSL' if secure else ''}"
-                    lname = ensure_unique_name(base, used_listener_names)
-                    new_listener_specs[spec] = lname
-                    listener_by_spec[spec] = lname
-                lname = new_listener_specs[spec]
-            if lname not in site_listeners[site.vhost_name]:
-                site_listeners[site.vhost_name].append(lname)
+                text = f"group                            {group}\n" + text
 
-    listener_maps: Dict[str, Set[str]] = {}
+    return text
+
+def patch_httpd_config(
+    existing_httpd: str,
+    sites: List[Site],
+    ols_vhosts_root: Path,
+    nginx_user: Optional[str] = None,
+    nginx_group: Optional[str] = None,
+    use_nginx_user_group: bool = False,
+) -> str:
+    text = existing_httpd or ""
+
+    if use_nginx_user_group:
+        text = patch_top_level_user_group(text, nginx_user, nginx_group)
+
+    desired_listener_maps: Dict[Tuple[int, bool], List[str]] = defaultdict(list)
+
     for site in sites:
-        map_line = build_listener_map_line(site)
-        for lname in site_listeners[site.vhost_name]:
-            listener_maps.setdefault(lname, set())
-            listener_maps[lname].add(map_line)
+        if site.listens:
+            for l in site.listens:
+                desired_listener_maps[(l.port, l.secure)].append(render_map_line(site))
+        else:
+            desired_listener_maps[(80, False)].append(render_map_line(site))
 
-    listener_map_lines: Dict[str, List[str]] = {name: sorted(lines) for name, lines in listener_maps.items()}
+    for k in list(desired_listener_maps.keys()):
+        desired_listener_maps[k] = dedupe_preserve(sorted(desired_listener_maps[k]))
+
+    listener_blocks = parse_listener_blocks(text)
+    by_key: Dict[Tuple[int, bool], ListenerBlockInfo] = {}
+    for lb in listener_blocks:
+        if lb.port is not None:
+            by_key.setdefault((lb.port, lb.secure), lb)
 
     replacements = []
-    for lst in existing:
-        new_block = inject_maps_into_listener_block(lst.text, listener_map_lines.get(lst.name, []))
-        replacements.append((lst.start, lst.end, new_block))
-    patched = replace_listener_blocks(clean, replacements)
+    used_existing_keys = set()
 
-    new_listener_blocks: List[str] = []
-    for (port, secure), lname in sorted(new_listener_specs.items()):
-        block = render_listener_block(
-            name=lname,
-            port=port,
-            secure=secure,
-            map_lines=listener_map_lines.get(lname, []),
-        )
-        new_listener_blocks.append(block)
+    for lb in listener_blocks:
+        key = (lb.port, lb.secure)
+        if key not in desired_listener_maps:
+            continue
+        if by_key.get(key) != lb:
+            continue
 
-    ext_blocks = []
-    for app in sorted(php_apps.values(), key=lambda x: x.name):
-        ext_blocks.append(render_php_extprocessor(app))
-    for app in sorted(proxy_apps.values(), key=lambda x: x.name):
-        ext_blocks.append(render_proxy_extprocessor(app))
+        old_block = text[lb.start:lb.end + 1]
+        open_idx = old_block.find("{")
+        body = old_block[open_idx + 1:-1]
+        new_body = upsert_managed_subblock(body, LISTENER_MAP_BEGIN, LISTENER_MAP_END, desired_listener_maps[key], indent="  ")
+        new_block = old_block[:open_idx + 1] + new_body + "}"
+        replacements.append((lb.start, lb.end + 1, new_block))
+        used_existing_keys.add(key)
 
-    vh_blocks = [render_virtualhost_block(site, ols_vhosts_root) for site in sites]
+    for start, end, repl in sorted(replacements, key=lambda x: x[0], reverse=True):
+        text = text[:start] + repl + text[end:]
 
-    if new_listener_blocks:
-        patched = append_managed_block(
-            patched, GLOBAL_BEGIN_LISTENERS, GLOBAL_END_LISTENERS, "\n\n".join(new_listener_blocks)
-        )
+    missing_listener_blocks = []
+    for key, map_lines in sorted(desired_listener_maps.items()):
+        if key in used_existing_keys or key in by_key:
+            continue
+        port, secure = key
+        lname = f"nginx_migrated_{'https' if secure else 'http'}_{port}"
+        missing_listener_blocks.append(render_listener_block(lname, port, secure, map_lines))
 
-    if ext_blocks:
-        patched = append_managed_block(
-            patched, GLOBAL_BEGIN_EXTPROC, GLOBAL_END_EXTPROC, "\n\n".join(ext_blocks)
-        )
+    php_apps = sorted({s.php_app for s in sites if s.php_app})
+    ext_blocks = [render_php_extprocessor(app) for app in php_apps]
+    vh_blocks = [render_virtualhost_block(s, ols_vhosts_root) for s in sites]
 
-    if vh_blocks:
-        patched = append_managed_block(
-            patched, GLOBAL_BEGIN_VHOSTS, GLOBAL_END_VHOSTS, "\n\n".join(vh_blocks)
-        )
+    managed_content = "\n".join(x.rstrip() for x in (missing_listener_blocks + ext_blocks + vh_blocks) if x).rstrip() + "\n"
+    text = upsert_global_managed_block(text, managed_content)
 
-    return patched, {k: sorted(v) for k, v in listener_map_lines.items()}, site_listeners
+    return text
 
-def write_preview_output(output_dir: Path,
-                         patched_httpd: str,
-                         vhost_texts: Dict[str, str],
-                         warnings: List[WarningItem],
-                         sites: List[Site],
-                         site_listeners: Dict[str, List[str]],
-                         listener_maps: Dict[str, List[str]]) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
+# ============================================================
+# Apply / ownership / restart
+# ============================================================
 
-    (output_dir / "httpd_config.patched.conf").write_text(patched_httpd, encoding="utf-8")
-
-    vhosts_root = output_dir / "vhosts"
-    for site_name, text in vhost_texts.items():
-        site_dir = vhosts_root / site_name
-        site_dir.mkdir(parents=True, exist_ok=True)
-        (site_dir / "vhconf.conf").write_text(text, encoding="utf-8")
-
-    json_dump([w.to_dict() for w in warnings], output_dir / "warnings.json")
-
-    report_lines = []
-    report_lines.append("NGINX -> OLS MIGRATION REPORT")
-    report_lines.append("=" * 80)
-    report_lines.append("")
-    report_lines.append(f"Generated at: {dt.datetime.now().isoformat()}")
-    report_lines.append("")
-    report_lines.append("Generated sites:")
-    report_lines.append("")
-
-    for site in sites:
-        report_lines.append(f"- vhost: {site.vhost_name}")
-        names_desc = " ".join(site.server_names) if site.server_names else "(none)"
-        report_lines.append(f"  server_names: {names_desc}")
-        listen_desc = ", ".join([f"{p}{'/ssl' if s else ''}" for p, s in sorted(site.listen_specs)])
-        report_lines.append(f"  listens: {listen_desc}")
-        report_lines.append(f"  docRoot: {site.root}")
-        report_lines.append(f"  enableExpires: {1 if site.enable_expires else 0}")
-        report_lines.append(f"  enableStapling: {1 if site.enable_stapling else 0}")
-        report_lines.append(f"  php_app: {site.php_app or '(none)'}")
-        report_lines.append(f"  listeners: {', '.join(site_listeners.get(site.vhost_name, []))}")
-        report_lines.append(f"  sources: {', '.join(sorted(site.source_files))}")
-        report_lines.append("")
-
-    report_lines.append("Listener maps:")
-    report_lines.append("")
-    for listener, maps in sorted(listener_maps.items()):
-        report_lines.append(f"- {listener}")
-        for m in maps:
-            report_lines.append(f"    {m}")
-    report_lines.append("")
-
-    report_lines.append(f"Warnings: {len(warnings)}")
-    report_lines.append("")
-    for w in warnings:
-        prefix = f"[{w.level.upper()}]"
-        where = []
-        if w.site:
-            where.append(f"site={w.site}")
-        if w.file:
-            where.append(f"file={w.file}")
-        if w.line:
-            where.append(f"line={w.line}")
-        suffix = f" ({', '.join(where)})" if where else ""
-        report_lines.append(f"{prefix} {w.message}{suffix}")
-
-    (output_dir / "migration_report.txt").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
-
-# FIXED: ownership / permission helpers
-def stat_uid_gid(path: Path) -> Tuple[Optional[int], Optional[int]]:
+def detect_target_uid_gid(vhosts_root: Path) -> Tuple[Optional[int], Optional[int]]:
     try:
-        st = path.stat()
-        return st.st_uid, st.st_gid
+        st = vhosts_root.stat()
+        fallback = (st.st_uid, st.st_gid)
     except Exception:
-        return None, None
+        fallback = (None, None)
 
-def stat_mode(path: Path) -> Optional[int]:
+    pairs = []
     try:
-        st = path.stat()
-        return stat.S_IMODE(st.st_mode)
+        for p in vhosts_root.iterdir():
+            try:
+                st = p.stat()
+                pairs.append((st.st_uid, st.st_gid))
+            except Exception:
+                pass
     except Exception:
-        return None
+        pass
 
-def detect_owner_group_for_site_dir(site_dir: Path, ols_vhosts_root: Path) -> Tuple[Optional[int], Optional[int]]:
-    for p in (site_dir, ols_vhosts_root, ols_vhosts_root.parent):
-        uid, gid = stat_uid_gid(p)
-        if uid is not None and gid is not None:
-            return uid, gid
-    return None, None
+    if not pairs:
+        return fallback
 
-def safe_chown(path: Path,
-               uid: Optional[int],
-               gid: Optional[int],
-               warnings: List[WarningItem],
-               site: str = "") -> None:
+    pair, _ = Counter(pairs).most_common(1)[0]
+    return pair
+
+def chown_if_possible(path: Path, uid: Optional[int], gid: Optional[int]):
     if uid is None or gid is None:
         return
     try:
-        os.chown(str(path), uid, gid)
-    except PermissionError:
-        warn(warnings, f"Could not chown '{path}' (permission denied).", file=str(path), site=site)
-    except Exception as e:
-        warn(warnings, f"Could not chown '{path}': {e}", file=str(path), site=site)
+        if os.geteuid() == 0:
+            os.chown(path, uid, gid)
+    except Exception:
+        pass
 
-def safe_chmod(path: Path,
-               mode: int,
-               warnings: List[WarningItem],
-               site: str = "") -> None:
+def apply_to_real_ols(
+    patched_httpd: str,
+    sites: List[Site],
+    vhconf_texts: Dict[str, str],
+    ols_httpd: Path,
+    ols_vhosts_root: Path,
+):
+    TERM.info_kv("Writing patched OLS config", str(ols_httpd))
+    backup_file(ols_httpd)
+    spit(ols_httpd, patched_httpd)
+
+    uid, gid = detect_target_uid_gid(ols_vhosts_root)
+
+    for site in sites:
+        site_dir = ols_vhosts_root / site.name
+        ensure_dir(site_dir)
+        chown_if_possible(site_dir, uid, gid)
+
+        vhconf = site_dir / "vhconf.conf"
+        if vhconf.exists():
+            backup_file(vhconf)
+        spit(vhconf, vhconf_texts[site.name])
+
+        chown_if_possible(vhconf, uid, gid)
+        TERM.debug(f"Wrote vhost config: {vhconf}")
+
+def detect_pkg_reinstall_cmd() -> Optional[List[str]]:
+    os_release = {}
     try:
-        os.chmod(path, mode)
-    except Exception as e:
-        warn(warnings, f"Could not chmod '{path}': {e}", file=str(path), site=site)
+        for line in Path("/etc/os-release").read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                os_release[k.strip()] = v.strip().strip('"')
+    except Exception:
+        pass
 
-def apply_to_real_ols(patched_httpd: str,
-                      vhost_texts: Dict[str, str],
-                      ols_httpd: Path,
-                      ols_vhosts_root: Path,
-                      warnings: List[WarningItem]) -> List[str]:
-    actions: List[str] = []
+    os_id = os_release.get("ID", "").lower()
+    like = os_release.get("ID_LIKE", "").lower()
 
-    ols_httpd.parent.mkdir(parents=True, exist_ok=True)
-    bak = backup_file(ols_httpd)
-    if bak:
-        actions.append(f"Backed up {ols_httpd} -> {bak}")
-    ols_httpd.write_text(patched_httpd, encoding="utf-8")
-    actions.append(f"Wrote {ols_httpd}")
+    if shutil.which("apt-get") and (os_id in ("debian", "ubuntu") or "debian" in like or "ubuntu" in like):
+        return ["apt-get", "install", "--reinstall", "-y", "openlitespeed"]
 
-    for site_name, text in vhost_texts.items():
-        site_dir = ols_vhosts_root / site_name
-        logs_dir = site_dir / "logs"
-        target = site_dir / "vhconf.conf"
+    if shutil.which("dnf") and any(x in (os_id + " " + like) for x in ("rhel", "centos", "rocky", "almalinux", "fedora")):
+        return ["dnf", "reinstall", "-y", "openlitespeed"]
 
-        uid, gid = detect_owner_group_for_site_dir(site_dir, ols_vhosts_root)
+    if shutil.which("yum") and any(x in (os_id + " " + like) for x in ("rhel", "centos", "rocky", "almalinux")):
+        return ["yum", "reinstall", "-y", "openlitespeed"]
 
-        site_dir_mode = stat_mode(site_dir) or stat_mode(ols_vhosts_root) or 0o755
-        logs_dir_mode = stat_mode(logs_dir) or site_dir_mode or 0o755
-        target_mode = stat_mode(target) or 0o640
+    if shutil.which("apt-get"):
+        return ["apt-get", "install", "--reinstall", "-y", "openlitespeed"]
+    if shutil.which("dnf"):
+        return ["dnf", "reinstall", "-y", "openlitespeed"]
+    if shutil.which("yum"):
+        return ["yum", "reinstall", "-y", "openlitespeed"]
 
-        site_dir.mkdir(parents=True, exist_ok=True)
-        logs_dir.mkdir(parents=True, exist_ok=True)
+    return None
 
-        safe_chown(site_dir, uid, gid, warnings, site=site_name)
-        safe_chown(logs_dir, uid, gid, warnings, site=site_name)
-        safe_chmod(site_dir, site_dir_mode, warnings, site=site_name)
-        safe_chmod(logs_dir, logs_dir_mode, warnings, site=site_name)
+def confirm_use_nginx_user_group(args) -> bool:
+    if args.yes:
+        return True
 
-        bak = backup_file(target)
-        if bak:
-            actions.append(f"Backed up {target} -> {bak}")
+    lines = [
+        TERM.colorize("WARNING:", "yellow", bold=True) + " --use-nginx-user-group with --apply will:",
+        "  - patch global OLS user/group",
+        "  - reinstall OpenLiteSpeed",
+        "  - remove /tmp/lshttpd/",
+        "  - restart lsws",
+        "",
+    ]
+    print("\n".join(lines), flush=True)
 
-        target.write_text(text, encoding="utf-8")
+    try:
+        ans = input(TERM.colorize("Do you want to continue? [y/N]: ", "yellow", bold=True)).strip().lower()
+    except EOFError:
+        return False
+    return ans in ("y", "yes")
 
-        safe_chown(target, uid, gid, warnings, site=site_name)
-        safe_chmod(target, target_mode, warnings, site=site_name)
+def reinstall_and_restart_ols():
+    cmd = detect_pkg_reinstall_cmd()
+    if not cmd:
+        raise RuntimeError("Could not determine package manager for OpenLiteSpeed reinstall")
 
-        actions.append(f"Wrote {target}")
+    TERM.info_kv("Running", " ".join(cmd))
+    subprocess.run(cmd, check=True)
 
-    return actions
+    TERM.info_kv("Removing", "/tmp/lshttpd/")
+    shutil.rmtree("/tmp/lshttpd", ignore_errors=True)
 
-def build_argument_parser() -> argparse.ArgumentParser:
+    TERM.info_kv("Restarting", "lsws")
+    subprocess.run(["systemctl", "restart", "lsws"], check=True)
+
+    TERM.ok("OpenLiteSpeed reinstall/reset/restart completed")
+
+# ============================================================
+# Report / output
+# ============================================================
+
+def build_report(
+    parsed_files_count: int,
+    sites: List[Site],
+    warnings: List[WarningEntry],
+    nginx_user: Optional[str],
+    nginx_group: Optional[str],
+    nginx_user_source: Optional[str],
+    duration_sec: float,
+) -> str:
+    lines = []
+    lines.append("Nginx -> OpenLiteSpeed Migration Report")
+    lines.append("=" * 40)
+    lines.append(f"Parsed nginx files: {parsed_files_count}")
+    lines.append(f"Generated sites: {len(sites)}")
+    lines.append(f"Warnings: {len(warnings)}")
+    lines.append(f"Duration: {duration_sec:.2f}s")
+    lines.append("")
+
+    if nginx_user or nginx_group:
+        lines.append(f"Detected nginx user/group: {nginx_user or '-'}:{nginx_group or '-'}")
+        if nginx_user_source:
+            lines.append(f"Detected from: {nginx_user_source}")
+        lines.append("")
+
+    lines.append("Sites:")
+    for s in sites:
+        listens = ", ".join([f"{l.port}{'/ssl' if l.secure else ''}" for l in s.listens]) or "80"
+        lines.append(f"- {s.name}")
+        lines.append(f"  primary: {s.primary_host}")
+        lines.append(f"  aliases: {', '.join(s.aliases) if s.aliases else '-'}")
+        lines.append(f"  root: {s.root}")
+        lines.append(f"  php_app: {s.php_app or '-'}")
+        lines.append(f"  listens: {listens}")
+        lines.append(f"  ssl: {'yes' if s.ssl_cert and s.ssl_key else 'no'}")
+        if s.source_refs:
+            lines.append(f"  sources: {', '.join(s.source_refs)}")
+        lines.append("")
+
+    if warnings:
+        lines.append("Warnings:")
+        for w in warnings:
+            where = w.source
+            if w.line:
+                where = f"{where}:{w.line}" if where else f"line {w.line}"
+            prefix = f"[{w.site}] " if w.site else ""
+            if where:
+                lines.append(f"- {prefix}{w.message} ({where})")
+            else:
+                lines.append(f"- {prefix}{w.message}")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+def print_final_summary(
+    parsed_files_count: int,
+    sites: List[Site],
+    warnings: List[WarningEntry],
+    output_dir: Path,
+    applied: bool,
+    ols_httpd: Path,
+    ols_vhosts_root: Path,
+    nginx_user: Optional[str] = None,
+    nginx_group: Optional[str] = None,
+    nginx_user_source: Optional[str] = None,
+    used_nginx_user_group: bool = False,
+    duration_sec: float = 0.0,
+):
+    if TERM.quiet:
+        applied_s = "yes" if applied else "no"
+        user_group = f"{nginx_user}:{nginx_group}" if nginx_user and nginx_group else "-"
+        print(
+            f"done parsed={parsed_files_count} sites={len(sites)} warnings={len(warnings)} "
+            f"apply={applied_s} user_group={user_group} preview={output_dir} time={duration_sec:.2f}s"
+        )
+        return
+
+    print()
+    TERM.title("NGINX -> OPENLITESPEED MIGRATION SUMMARY")
+    TERM.kv("Parsed nginx files", str(parsed_files_count), "white")
+    TERM.kv("Generated sites", str(len(sites)), "green")
+    TERM.kv("Warnings", str(len(warnings)), TERM.warning_count_color(len(warnings)))
+    TERM.kv("Duration", f"{duration_sec:.2f}s", "white")
+
+    if nginx_user and nginx_group:
+        TERM.kv("OLS user/group target", f"{nginx_user}:{nginx_group}", "white")
+        if nginx_user_source:
+            TERM.kv("Source", nginx_user_source, "gray")
+
+    TERM.kv("Preview written to", str(output_dir), "cyan")
+
+    if applied:
+        TERM.kv("Applied OLS config", str(ols_httpd), "green")
+        TERM.kv("Applied vhosts", str(ols_vhosts_root), "green")
+        if not used_nginx_user_group:
+            TERM.note("Restart/reload OLS manually to apply config changes.")
+    else:
+        TERM.note("Preview only. Nothing has been written to live OLS paths.")
+
+    print()
+    TERM.print_warning_summary(warnings, limit=8)
+    print()
+
+# ============================================================
+# CLI
+# ============================================================
+
+def preprocess_argv(argv: List[str]) -> List[str]:
+    out = argv[:]
+    if len(out) >= 2 and out[1] == "help":
+        out[1] = "--help"
+    out = ["--help" if x == "-H" else x for x in out]
+    return out
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    formatter = lambda prog: argparse.HelpFormatter(prog, max_help_position=38, width=110)
+
     p = argparse.ArgumentParser(
-        description="Convert nginx config to OpenLiteSpeed config.",
-        add_help=False
+        description="Single-file nginx -> OpenLiteSpeed migrator",
+        formatter_class=formatter,
     )
-    p.add_argument("-h", "--help", "-H", action="help", help="show this help message and exit")
-    p.add_argument("--nginx", default="/etc/nginx",
-                   help="Path to nginx.conf, a single nginx .conf file, or nginx config directory")
-    p.add_argument("--ols-httpd", default="/usr/local/lsws/conf/httpd_config.conf",
-                   help="Path to OLS global httpd_config.conf")
-    p.add_argument("--ols-vhosts-root", default="/usr/local/lsws/conf/vhosts",
-                   help="Path to OLS vhosts root")
-    p.add_argument("--output", default=DEFAULT_OUTPUT_DIR,
-                   help="Preview output directory")
-    p.add_argument("--apply", action="store_true",
-                   help="Write generated config to real OLS paths")
-    p.add_argument("--disable-htaccess", action="store_true",
-                   help="Disable OLS autoLoadHtaccess")
-    p.add_argument("--extra-include-glob", action="append", default=[],
-                   help="Additional nginx include glob to parse as extra top-level input")
+
+    p.add_argument(
+        "--nginx",
+        default=DEFAULT_NGINX,
+        help=f"nginx file or directory (default: {DEFAULT_NGINX})",
+    )
+    p.add_argument(
+        "--ols-httpd",
+        default=DEFAULT_OLS_HTTPD,
+        help=f"OLS httpd_config.conf path (default: {DEFAULT_OLS_HTTPD})",
+    )
+    p.add_argument(
+        "--ols-vhosts-root",
+        metavar="OLS_VH_ROOT",
+        default=DEFAULT_OLS_VHOSTS_ROOT,
+        help=f"OLS vhosts root (default: {DEFAULT_OLS_VHOSTS_ROOT})",
+    )
+    p.add_argument(
+        "--output",
+        default=DEFAULT_OUTPUT,
+        help=f"preview output directory (default: {DEFAULT_OUTPUT})",
+    )
+    p.add_argument(
+        "--apply",
+        action="store_true",
+        help="write patched config to real OLS paths",
+    )
+    p.add_argument(
+        "--disable-htaccess",
+        action="store_true",
+        help="disable autoLoadHtaccess in generated vhconf",
+    )
+    p.add_argument(
+        "--extra-include",
+        dest="extra_include_glob",
+        action="append",
+        default=[],
+        metavar="EXT_NGINX_CONF",
+        help="additional file/folder/glob to parse as nginx sources",
+    )
+    p.add_argument(
+        "--extra-include-glob",
+        dest="extra_include_glob",
+        action="append",
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--use-nginx-user-group",
+        action="store_true",
+        help="patch global OLS user/group from nginx and reinstall/restart OLS on --apply",
+    )
+    p.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="assume yes for confirmation prompts",
+    )
+    p.add_argument(
+        "--no-color",
+        action="store_true",
+        help="disable ANSI color output",
+    )
+
+    mx = p.add_mutually_exclusive_group()
+    mx.add_argument(
+        "--quiet", "--quite",
+        dest="quiet",
+        action="store_true",
+        help="reduce console output to a minimal summary",
+    )
+    mx.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show verbose/debug progress details",
+    )
+
     return p
 
-def main() -> int:
-    if len(sys.argv) >= 2 and sys.argv[1].lower() == "help":
-        sys.argv = [sys.argv[0], "--help"] + sys.argv[2:]
+# ============================================================
+# main
+# ============================================================
 
-    parser = build_argument_parser()
-    args = parser.parse_args()
+def main():
+    global TERM
+
+    start_ts = time.time()
+
+    argv = preprocess_argv(sys.argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv[1:])
+
+    TERM = Terminal(quiet=args.quiet, verbose=args.verbose, no_color=args.no_color)
 
     nginx_path = Path(args.nginx)
     ols_httpd = Path(args.ols_httpd)
     ols_vhosts_root = Path(args.ols_vhosts_root)
     output_dir = Path(args.output)
-    enable_htaccess = not args.disable_htaccess
 
-    warnings: List[WarningItem] = []
+    warnings: List[WarningEntry] = []
 
-    if not nginx_path.exists():
-        print(f"ERROR: nginx path does not exist: {nginx_path}", file=sys.stderr)
-        return 1
+    TERM.info_kv("Parsing nginx configuration")
+    all_nodes, ctx = parse_nginx_sources(nginx_path, args.extra_include_glob, warnings)
+    parsed_files_count = len(ctx["parsed_files"])
 
-    if not ols_httpd.exists():
-        warn(warnings, f"OLS httpd config does not exist yet: {ols_httpd}. A new file will be written.")
+    nginx_user = nginx_group = nginx_user_source = None
+    if args.use_nginx_user_group:
+        nginx_user, nginx_group, nginx_user_source = detect_nginx_user_group(all_nodes)
+        if not nginx_user or not nginx_group:
+            add_warning(warnings, "Could not detect nginx user/group; global OLS user/group will not be patched")
+            nginx_user = nginx_group = None
+        else:
+            TERM.info_kv("Detected nginx user/group", f"{nginx_user}:{nginx_group}")
 
-    parsed = collect_nginx_sources(
-        nginx_path,
-        warnings,
-        extra_include_globs=args.extra_include_glob
-    )
+    TERM.info_kv("Collecting upstreams and server blocks")
+    upstreams = collect_upstreams(all_nodes, warnings)
+    servers = collect_servers(all_nodes, upstreams, warnings)
 
-    if not parsed:
-        print("ERROR: No nginx config files could be parsed.", file=sys.stderr)
-        return 1
+    TERM.info_kv("Merging nginx servers into OLS sites")
+    sites = merge_servers_to_sites(servers, warnings)
+    TERM.debug(f"Generated site names: {', '.join(s.name for s in sites)}")
 
-    servers, upstreams = extract_nginx_objects(parsed, warnings)
-    sites = merge_servers_to_sites(servers, warnings) if servers else []
+    try:
+        existing_httpd = slurp(ols_httpd) if ols_httpd.exists() else ""
+    except Exception as e:
+        add_warning(warnings, f"Could not read existing OLS httpd config: {e}", source=str(ols_httpd))
+        existing_httpd = ""
 
-    vhost_texts: Dict[str, str] = {}
-    php_apps: Dict[str, PhpApp] = {}
-    proxy_apps: Dict[str, ProxyApp] = {}
-
-    for site in sites:
-        vh_text, site_php_apps, site_proxy_apps = render_site_vhconf(
-            site=site,
-            upstreams=upstreams,
-            warnings=warnings,
-            enable_htaccess=enable_htaccess,
-        )
-        vhost_texts[site.vhost_name] = vh_text
-        php_apps.update(site_php_apps)
-        proxy_apps.update(site_proxy_apps)
-
-    orig_httpd = read_text_file(ols_httpd) if ols_httpd.exists() else "# Auto-created preview baseline for OpenLiteSpeed\n"
-
-    patched_httpd, listener_maps, site_listeners = patch_httpd_config(
-        orig_httpd=orig_httpd,
+    TERM.info_kv("Patching OLS global httpd_config.conf")
+    patched_httpd = patch_httpd_config(
+        existing_httpd=existing_httpd,
         sites=sites,
-        php_apps=php_apps,
-        proxy_apps=proxy_apps,
         ols_vhosts_root=ols_vhosts_root,
-        warnings=warnings,
+        nginx_user=nginx_user,
+        nginx_group=nginx_group,
+        use_nginx_user_group=args.use_nginx_user_group and bool(nginx_user and nginx_group),
     )
 
-    write_preview_output(
-        output_dir=output_dir,
-        patched_httpd=patched_httpd,
-        vhost_texts=vhost_texts,
-        warnings=warnings,
+    TERM.info_kv("Rendering vhost configuration files")
+    vhconf_texts: Dict[str, str] = {}
+    for site in sites:
+        vhconf_texts[site.name] = render_site_vhconf(site, auto_htaccess=not args.disable_htaccess)
+
+    TERM.info_kv("Writing preview output")
+    ensure_dir(output_dir)
+    spit(output_dir / "httpd_config.patched.conf", patched_httpd)
+
+    preview_vhosts_root = output_dir / "vhosts"
+    for site in sites:
+        spit(preview_vhosts_root / site.name / "vhconf.conf", vhconf_texts[site.name])
+        TERM.debug(f"Preview vhost written: {preview_vhosts_root / site.name / 'vhconf.conf'}")
+
+    spit(output_dir / "warnings.json", json.dumps([asdict(w) for w in warnings], indent=2, ensure_ascii=False) + "\n")
+
+    duration_pre_apply = time.time() - start_ts
+    report = build_report(
+        parsed_files_count=parsed_files_count,
         sites=sites,
-        site_listeners=site_listeners,
-        listener_maps=listener_maps,
+        warnings=warnings,
+        nginx_user=nginx_user,
+        nginx_group=nginx_group,
+        nginx_user_source=nginx_user_source,
+        duration_sec=duration_pre_apply,
     )
+    spit(output_dir / "migration_report.txt", report)
 
-    print(f"Preview written to: {output_dir}")
-    print(f"  - {output_dir / 'httpd_config.patched.conf'}")
-    print(f"  - {output_dir / 'vhosts'}")
-    print(f"  - {output_dir / 'warnings.json'}")
-    print(f"  - {output_dir / 'migration_report.txt'}")
+    TERM.ok("Preview generated successfully")
 
     if args.apply:
-        actions = apply_to_real_ols(
+        if args.use_nginx_user_group:
+            if not confirm_use_nginx_user_group(args):
+                TERM.error("User cancelled.")
+                sys.exit(1)
+
+        TERM.info_kv("Applying patched config to live OLS paths")
+        apply_to_real_ols(
             patched_httpd=patched_httpd,
-            vhost_texts=vhost_texts,
+            sites=sites,
+            vhconf_texts=vhconf_texts,
             ols_httpd=ols_httpd,
             ols_vhosts_root=ols_vhosts_root,
-            warnings=warnings,
         )
-        print("")
-        print("Applied changes:")
-        for a in actions:
-            print(f"  - {a}")
-        print("")
-        print("Restart/reload OpenLiteSpeed after review.")
-        print("Example: sudo /usr/local/lsws/bin/lswsctrl restart")
-    else:
-        print("")
-        print("Preview only. No real OLS files were changed.")
-        print("Use --apply to write to the real OLS paths.")
 
-    print("")
-    print(f"autoLoadHtaccess default: {'YES' if enable_htaccess else 'NO'}")
-    print(f"Parsed nginx files: {len(parsed)}")
-    print(f"Generated sites: {len(sites)}")
-    print(f"Warnings: {len(warnings)}")
+        if args.use_nginx_user_group and nginx_user and nginx_group:
+            reinstall_and_restart_ols()
+        else:
+            TERM.ok("Live OLS config applied")
 
-    return 0
+    duration_total = time.time() - start_ts
+
+    print_final_summary(
+        parsed_files_count=parsed_files_count,
+        sites=sites,
+        warnings=warnings,
+        output_dir=output_dir,
+        applied=args.apply,
+        ols_httpd=ols_httpd,
+        ols_vhosts_root=ols_vhosts_root,
+        nginx_user=nginx_user,
+        nginx_group=nginx_group,
+        nginx_user_source=nginx_user_source,
+        used_nginx_user_group=args.use_nginx_user_group,
+        duration_sec=duration_total,
+    )
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
