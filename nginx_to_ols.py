@@ -433,7 +433,7 @@ def extract_proxy_address(raw: str, upstreams: Dict[str, List[str]]) -> Optional
     # nginx unix socket format: unix:/path/to/sock: (trailing colon is nginx separator)
     # convert to OLS uds:// format
     if s.startswith("unix:"):
-        sock_path = s[len("unix:"):].rstrip(":")
+        sock_path = s[len("unix:"):].rstrip(":").lstrip("/")
         return ("uds://" + sock_path) or None
     host_port = s.split("/")[0]
     if host_port in upstreams and upstreams[host_port]:
@@ -443,7 +443,7 @@ def extract_proxy_address(raw: str, upstreams: Dict[str, List[str]]) -> Optional
                 backend = backend[len(scheme):]
                 break
         if backend.startswith("unix:"):
-            sock_path = backend[len("unix:"):].rstrip(":")
+            sock_path = backend[len("unix:"):].rstrip(":").lstrip("/")
             return ("uds://" + sock_path) or None
         host_port = backend.split("/")[0]
     return host_port or None
