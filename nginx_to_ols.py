@@ -2643,13 +2643,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     mx = p.add_mutually_exclusive_group()
     mx.add_argument(
-        "--quiet", "--quite",
+        "-q", "--quiet", "--quite",
         dest="quiet",
         action="store_true",
         help="reduce console output to a minimal summary",
     )
     mx.add_argument(
-        "--verbose",
+        "-v", "--verbose",
         action="store_true",
         help="show verbose/debug progress details",
     )
