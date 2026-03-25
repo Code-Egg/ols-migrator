@@ -141,8 +141,10 @@ class Terminal:
     def print_warning_summary(self, warnings: List["WarningEntry"], limit: int = 8):
         if self.quiet or not warnings:
             return
-        counts = Counter(w.message for w in warnings).most_common(limit)
-        self.warn(f"Top warning types ({len(counts)} shown):")
+        effective_limit = None if (self.verbose or limit <= 0) else limit
+        counts = Counter(w.message for w in warnings).most_common(effective_limit)
+        label = "All warning types" if effective_limit is None else f"Top warning types"
+        self.warn(f"{label} ({len(counts)} shown):")
         for msg, count in counts:
             tag = "Skip" if "skip" in msg.lower() else "Warn"
             tag_color = "white" if tag == "Skip" else "yellow"
@@ -612,6 +614,9 @@ def parse_nginx_file_expanded(path: Path, ctx: dict, stack: Optional[List[Path]]
     if stack is None:
         stack = [path.resolve()]
     real = path.resolve()
+    if str(real) in ctx["parsed_files"]:
+        TERM.debug(f"Skipping already-parsed nginx file: {real}")
+        return []
     ctx["parsed_files"].add(str(real))
     TERM.debug(f"Parsing nginx file: {real}")
     try:
@@ -749,8 +754,27 @@ def detect_nginx_user_group(all_nodes: List[Node]) -> Tuple[Optional[str], Optio
             return user, group, f"{node.source}:{node.line}"
     return None, None, None
 
+_UPSTREAM_REF_DIRECTIVES = frozenset((
+    "fastcgi_pass", "proxy_pass", "uwsgi_pass", "scgi_pass", "grpc_pass", "memcached_pass",
+))
+
+def _collect_referenced_upstream_names(all_nodes: List[Node]) -> Set[str]:
+    """Return upstream names actually referenced by any nginx pass directive."""
+    names: Set[str] = set()
+    for node in iter_nodes(all_nodes):
+        if node.name not in _UPSTREAM_REF_DIRECTIVES or not node.args:
+            continue
+        raw = node.args[0].strip()
+        for scheme in ("grpcs://", "grpc://", "https://", "http://", "uwsgi://", "scgi://"):
+            if raw.startswith(scheme):
+                raw = raw[len(scheme):]
+                break
+        names.add(raw.split("/")[0])
+    return names
+
 def collect_upstreams(all_nodes: List[Node], warnings: List[WarningEntry]) -> Dict[str, List[str]]:
     upstreams: Dict[str, List[str]] = {}
+    referenced = _collect_referenced_upstream_names(all_nodes)
 
     for node in iter_nodes(all_nodes):
         if node.name != "upstream" or not node.children or not node.args:
@@ -760,7 +784,7 @@ def collect_upstreams(all_nodes: List[Node], warnings: List[WarningEntry]) -> Di
         for ch in node.children:
             if ch.name == "server" and not ch.children and ch.args:
                 backends.append(ch.args[0])
-        if len(backends) > 1:
+        if len(backends) > 1 and name in referenced:
             add_warning(
                 warnings,
                 f"Upstream '{name}' has multiple backends; only the first one may be used where needed: {backends[0]}",
