@@ -430,6 +430,11 @@ def extract_proxy_address(raw: str, upstreams: Dict[str, List[str]]) -> Optional
         if s.startswith(scheme):
             s = s[len(scheme):]
             break
+    # nginx unix socket format: unix:/path/to/sock: (trailing colon is nginx separator)
+    # convert to OLS uds:// format
+    if s.startswith("unix:"):
+        sock_path = s[len("unix:"):].rstrip(":")
+        return ("uds://" + sock_path) or None
     host_port = s.split("/")[0]
     if host_port in upstreams and upstreams[host_port]:
         backend = upstreams[host_port][0].strip()
@@ -437,6 +442,9 @@ def extract_proxy_address(raw: str, upstreams: Dict[str, List[str]]) -> Optional
             if backend.startswith(scheme):
                 backend = backend[len(scheme):]
                 break
+        if backend.startswith("unix:"):
+            sock_path = backend[len("unix:"):].rstrip(":")
+            return ("uds://" + sock_path) or None
         host_port = backend.split("/")[0]
     return host_port or None
 
@@ -1684,15 +1692,16 @@ def convert_location(site: Site, loc: NginxLocation, warnings: List[WarningEntry
             if _raw.startswith(_scheme):
                 _raw = _raw[len(_scheme):]
                 break
-        _slash = _raw.find("/")
-        if _slash >= 0 and _raw[_slash:] not in ("", "/"):
-            add_warning(
-                warnings,
-                f"proxy_pass path '{_raw[_slash:]}' stripped; OLS only supports host:port in proxy address, original request URI will be used",
-                source=loc.source,
-                line=loc.line,
-                site=site.name,
-            )
+        if not _raw.startswith("unix:"):
+            _slash = _raw.find("/")
+            if _slash >= 0 and _raw[_slash:] not in ("", "/"):
+                add_warning(
+                    warnings,
+                    f"proxy_pass path '{_raw[_slash:]}' stripped; OLS only supports host:port in proxy address, original request URI will be used",
+                    source=loc.source,
+                    line=loc.line,
+                    site=site.name,
+                )
 
         name = sanitize_proxy_name(loc.path)
         used_names = {p.name for p in site.proxy_specs}
