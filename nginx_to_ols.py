@@ -114,7 +114,7 @@ class Terminal:
         if self.quiet:
             return
         if value:
-            self._status("INFO", f"{key:<34} {value}")
+            self._status("INFO", f"{key} {value}")
         else:
             self._status("INFO", key)
 
@@ -143,7 +143,10 @@ class Terminal:
         counts = Counter(w.message for w in warnings).most_common(limit)
         self.warn(f"Top warning types ({len(counts)} shown):")
         for msg, count in counts:
-            print(f"  - {self.colorize(str(count).rjust(3), 'yellow', bold=True)} x {msg}")
+            tag = "Skip" if "skip" in msg.lower() else "Warn"
+            tag_color = "white" if tag == "Skip" else "yellow"
+            tag_str = self.colorize(f"[{tag}]", tag_color, bold=True)
+            print(f"{tag_str} {self.colorize(str(count), 'yellow', bold=True)} x {msg}")
 
 TERM = Terminal()
 
@@ -188,6 +191,7 @@ class NginxLocation:
     deny: List[str] = field(default_factory=list)
     fastcgi_pass: Optional[str] = None
     proxy_pass: Optional[str] = None
+    proxy_address: Optional[str] = None  # resolved host:port for OLS extprocessor
     rewrite_directives: List[List[str]] = field(default_factory=list)
     return_args: List[str] = field(default_factory=list)
     add_headers: List[List[str]] = field(default_factory=list)
@@ -230,6 +234,16 @@ class ContextSpec:
     line: int = 0
 
 @dataclass
+class ProxySpec:
+    name: str
+    address: str
+    uri: str
+    allow: List[str] = field(default_factory=list)
+    deny: List[str] = field(default_factory=list)
+    source: str = ""
+    line: int = 0
+
+@dataclass
 class Site:
     name: str
     primary_host: str
@@ -249,6 +263,7 @@ class Site:
     contexts: List[ContextSpec] = field(default_factory=list)
     rewrite_rules: List[str] = field(default_factory=list)
     front_controller_rules: List[str] = field(default_factory=list)
+    proxy_specs: List[ProxySpec] = field(default_factory=list)
 
 @dataclass
 class ListenerBlockInfo:
@@ -395,6 +410,32 @@ def inode_identity(path: Path) -> Optional[Tuple[int, int]]:
         return (st.st_dev, st.st_ino)
     except Exception:
         return None
+
+def sanitize_proxy_name(path: str) -> str:
+    p = path.lstrip("^")
+    p = p.strip("/")
+    p = re.sub(r"[^a-zA-Z0-9]+", "_", p)
+    p = re.sub(r"_+", "_", p)
+    p = p.strip("_")
+    if not p:
+        p = "root"
+    return p + "_proxy"
+
+def extract_proxy_address(raw: str, upstreams: Dict[str, List[str]]) -> Optional[str]:
+    s = raw.strip()
+    for scheme in ("https://", "http://"):
+        if s.startswith(scheme):
+            s = s[len(scheme):]
+            break
+    host_port = s.split("/")[0]
+    if host_port in upstreams and upstreams[host_port]:
+        backend = upstreams[host_port][0].strip()
+        for scheme in ("https://", "http://"):
+            if backend.startswith(scheme):
+                backend = backend[len(scheme):]
+                break
+        host_port = backend.split("/")[0]
+    return host_port or None
 
 def is_named_location_path(path: str) -> bool:
     return path.strip().startswith("@")
@@ -862,6 +903,7 @@ def parse_location(node: Node, upstreams: Dict[str, List[str]], warnings: List[W
 
         if ch.name == "proxy_pass" and ch.args and not loc.proxy_pass:
             loc.proxy_pass = " ".join(ch.args)
+            loc.proxy_address = extract_proxy_address(loc.proxy_pass, upstreams)
             continue
 
         if ch.name == "rewrite" and ch.args:
@@ -1414,6 +1456,16 @@ def convert_location(site: Site, loc: NginxLocation, warnings: List[WarningEntry
         return
 
     if loc.path == "/" and loc.match_type in ("prefix", "prefix_no_regex", "exact"):
+        if loc.try_files:
+            last = loc.try_files[-1]
+            if last.startswith("@"):
+                add_warning(
+                    warnings,
+                    f"try_files fallback to named location '{last}' not supported in OLS; skipped",
+                    source=loc.source,
+                    line=loc.line,
+                    site=site.name,
+                )
         rules = try_files_to_rewrite(loc)
         for r in rules:
             if r not in site.front_controller_rules:
@@ -1593,13 +1645,50 @@ def convert_location(site: Site, loc: NginxLocation, warnings: List[WarningEntry
             return
 
     if loc.proxy_pass:
-        add_warning(
-            warnings,
-            f"proxy_pass not converted for location '{loc.path}'; skipped",
+        if not loc.proxy_address:
+            add_warning(
+                warnings,
+                f"proxy_pass '{loc.proxy_pass}' could not be resolved for location '{loc.path}'; skipped",
+                source=loc.source,
+                line=loc.line,
+                site=site.name,
+            )
+            return
+        _raw = loc.proxy_pass.strip()
+        for _scheme in ("https://", "http://"):
+            if _raw.startswith(_scheme):
+                _raw = _raw[len(_scheme):]
+                break
+        _slash = _raw.find("/")
+        if _slash >= 0 and _raw[_slash:] not in ("", "/"):
+            add_warning(
+                warnings,
+                f"proxy_pass path '{_raw[_slash:]}' stripped; OLS only supports host:port in proxy address, original request URI will be used",
+                source=loc.source,
+                line=loc.line,
+                site=site.name,
+            )
+
+        name = sanitize_proxy_name(loc.path)
+        used_names = {p.name for p in site.proxy_specs}
+        if name in used_names:
+            add_warning(
+                warnings,
+                f"proxy extprocessor name '{name}' already used in this vhost; location '{loc.path}' skipped",
+                source=loc.source,
+                line=loc.line,
+                site=site.name,
+            )
+            return
+        site.proxy_specs.append(ProxySpec(
+            name=name,
+            address=loc.proxy_address,
+            uri=loc.path,
+            allow=loc.allow[:],
+            deny=loc.deny[:],
             source=loc.source,
             line=loc.line,
-            site=site.name,
-        )
+        ))
         return
 
     if is_redundant_exact_or_prefix(loc, site.root):
@@ -1847,8 +1936,14 @@ def render_site_vhconf(site: Site, auto_htaccess: bool = True) -> str:
     if site.error_log:
         parts.append(render_errorlog(site.error_log))
 
+    for ps in site.proxy_specs:
+        parts.append(render_proxy_extprocessor(ps))
+
     for c in site.contexts:
         parts.append(render_context(c, auto_htaccess=auto_htaccess))
+
+    for ps in site.proxy_specs:
+        parts.append(render_proxy_context(ps))
 
     all_rewrite_rules = site.rewrite_rules + site.front_controller_rules
     parts.append(render_rewrite_block(all_rewrite_rules, auto_htaccess))
@@ -1859,6 +1954,35 @@ def render_site_vhconf(site: Site, auto_htaccess: bool = True) -> str:
         parts.append(ssl_block)
 
     return "\n".join(p.rstrip() for p in parts if p).rstrip() + "\n"
+
+def render_proxy_extprocessor(ps: ProxySpec) -> str:
+    return (
+        f"extprocessor {ps.name} {{\n"
+        f"  type                    proxy\n"
+        f"  address                 {ps.address}\n"
+        f"  maxConns                100\n"
+        f"  initTimeout             60\n"
+        f"  retryTimeout            60\n"
+        f"  respBuffer              0\n"
+        f"}}\n"
+    )
+
+def render_proxy_context(ps: ProxySpec) -> str:
+    lines = [
+        f"context {ps.uri} {{",
+        f"  type                    proxy",
+        f"  handler                 {ps.name}",
+        f"  addDefaultCharset       off",
+    ]
+    if ps.allow or ps.deny:
+        lines.append("  accessControl  {")
+        if ps.allow:
+            lines.append(f"    allow                 {', '.join(ps.allow)}")
+        for item in ps.deny:
+            lines.append(f"    deny                  {item}")
+        lines.append("  }")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
 
 def render_php_extprocessor(app: str) -> str:
     app = app or "lsphp"
@@ -2372,10 +2496,11 @@ def build_report(
             if w.line:
                 where = f"{where}:{w.line}" if where else f"line {w.line}"
             prefix = f"[{w.site}] " if w.site else ""
+            tag = "Skip" if "skip" in w.message.lower() else "Warn"
             if where:
-                lines.append(f"- {prefix}{w.message} ({where})")
+                lines.append(f"- [{tag}] {prefix}{w.message} ({where})")
             else:
-                lines.append(f"- {prefix}{w.message}")
+                lines.append(f"- [{tag}] {prefix}{w.message}")
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -2552,6 +2677,22 @@ def main():
     output_dir = Path(args.output)
 
     warnings: List[WarningEntry] = []
+
+    if not nginx_path.exists():
+        TERM.error(f"nginx path does not exist: {nginx_path}")
+        sys.exit(1)
+
+    if args.apply:
+        errors = []
+        if not ols_httpd.parent.is_dir():
+            errors.append(f"OLS config directory does not exist: {ols_httpd.parent}")
+        if not ols_vhosts_root.is_dir():
+            errors.append(f"OLS vhosts root does not exist: {ols_vhosts_root}")
+        if errors:
+            for msg in errors:
+                TERM.error(msg)
+            TERM.error("Is OpenLiteSpeed installed? Aborting --apply.")
+            sys.exit(1)
 
     TERM.info_kv("Parsing nginx configuration")
     all_nodes, ctx = parse_nginx_sources(nginx_path, args.extra_include_glob, warnings)
