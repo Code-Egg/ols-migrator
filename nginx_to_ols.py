@@ -2164,21 +2164,67 @@ def upsert_managed_subblock(body: str, begin_marker: str, end_marker: str, conte
         body += "\n"
     return body + new_chunk + "\n"
 
+def find_global_managed_span(text: str) -> Optional[Tuple[int, int]]:
+    start = text.find(GLOBAL_MANAGED_BEGIN)
+    if start < 0:
+        return None
+    end = text.find(GLOBAL_MANAGED_END, start)  # search only after BEGIN
+    if end < 0:
+        return None
+    return (start, end + len(GLOBAL_MANAGED_END))
+
+def _strip_orphaned_managed_end(text: str) -> str:
+    """Remove any END markers that appear before the first BEGIN (left by OLS WebAdmin restructuring)."""
+    while True:
+        begin_pos = text.find(GLOBAL_MANAGED_BEGIN)
+        end_pos = text.find(GLOBAL_MANAGED_END)
+        if end_pos < 0:
+            break
+        if begin_pos >= 0 and end_pos >= begin_pos:
+            break  # END is after (or at) BEGIN — not orphaned
+        # Remove the orphaned END line
+        line_start = text.rfind("\n", 0, end_pos) + 1
+        line_end = text.find("\n", end_pos)
+        line_end = line_end + 1 if line_end >= 0 else len(text)
+        text = text[:line_start] + text[line_end:]
+    return text
+
 def upsert_global_managed_block(text: str, block_content: str) -> str:
-    pattern = re.compile(re.escape(GLOBAL_MANAGED_BEGIN) + r".*?" + re.escape(GLOBAL_MANAGED_END), re.S)
+    text = _strip_orphaned_managed_end(text)
     wrapped = f"{GLOBAL_MANAGED_BEGIN}\n{block_content.rstrip()}\n{GLOBAL_MANAGED_END}\n"
-    if pattern.search(text):
-        return pattern.sub(wrapped, text)
+    span = find_global_managed_span(text)
+    if span:
+        return text[:span[0]] + wrapped + text[span[1]:]
     if text and not text.endswith("\n"):
         text += "\n"
     return text + "\n" + wrapped
 
-def find_global_managed_span(text: str) -> Optional[Tuple[int, int]]:
-    pattern = re.compile(re.escape(GLOBAL_MANAGED_BEGIN) + r".*?" + re.escape(GLOBAL_MANAGED_END), re.S)
-    m = pattern.search(text)
-    if not m:
-        return None
-    return (m.start(), m.end())
+def collect_external_vhost_names(httpd_text: str, ols_vhosts_root: Optional[str] = None) -> Set[str]:
+    """Return virtualhost names defined outside the managed block.
+
+    If ols_vhosts_root is given, vhosts whose configFile is under that root are
+    excluded — they were placed there by our script (or OLS WebAdmin for the same
+    site) and should not be treated as foreign conflicts.
+    """
+    managed_span = find_global_managed_span(httpd_text)
+    if managed_span:
+        search_text = httpd_text[:managed_span[0]] + httpd_text[managed_span[1]:]
+    else:
+        search_text = httpd_text
+    vhroot_prefix = ols_vhosts_root.rstrip("/") + "/" if ols_vhosts_root else None
+    names: Set[str] = set()
+    for m in re.finditer(r"(?m)^\s*virtualhost\s+([A-Za-z0-9._:-]+)\s*\{", search_text):
+        name = m.group(1)
+        if vhroot_prefix:
+            brace_pos = search_text.find("{", m.start())
+            if brace_pos >= 0:
+                # Look for configFile within the next 1500 chars (well within any vhost block)
+                snippet = search_text[brace_pos:brace_pos + 1500]
+                cf = re.search(r"configFile\s+(\S+)", snippet)
+                if cf and cf.group(1).startswith(vhroot_prefix):
+                    continue  # configFile is under our vhosts root — not a foreign vhost
+        names.add(name)
+    return names
 
 def patch_top_level_user_group(httpd_text: str, user: Optional[str], group: Optional[str]) -> str:
     text = httpd_text
@@ -2205,6 +2251,21 @@ def patch_top_level_user_group(httpd_text: str, user: Optional[str], group: Opti
                 text = f"group                            {group}\n" + text
 
     return text
+
+def _strip_maps_outside_listener_maps_block(body: str) -> str:
+    """Remove map lines from a listener body that are outside the managed MAPS subblock.
+
+    Called only when the MAPS block already existed (OLS WebAdmin may have extracted
+    map lines out of it, leaving duplicates).
+    """
+    begin_pos = body.find(LISTENER_MAP_BEGIN)
+    end_pos = body.find(LISTENER_MAP_END)
+    if begin_pos < 0 or end_pos < 0 or end_pos < begin_pos:
+        return body
+    managed_end = end_pos + len(LISTENER_MAP_END)
+    before = re.sub(r"(?m)^\s*map\s+.*\n?", "", body[:begin_pos])
+    after = re.sub(r"(?m)^\s*map\s+.*\n?", "", body[managed_end:])
+    return before + body[begin_pos:managed_end] + after
 
 def patch_httpd_config(
     existing_httpd: str,
@@ -2255,7 +2316,11 @@ def patch_httpd_config(
         old_block = text[lb.start:lb.end + 1]
         open_idx = old_block.find("{")
         body = old_block[open_idx + 1:-1]
+        had_maps_block = LISTENER_MAP_BEGIN in body
         new_body = upsert_managed_subblock(body, LISTENER_MAP_BEGIN, LISTENER_MAP_END, desired_listener_maps[key], indent="  ")
+        if had_maps_block:
+            # OLS WebAdmin may have extracted map lines outside our subblock — strip duplicates
+            new_body = _strip_maps_outside_listener_maps_block(new_body)
         new_block = old_block[:open_idx + 1] + new_body + "}"
         replacements.append((lb.start, lb.end + 1, new_block))
         used_existing_keys.add(key)
@@ -2724,6 +2789,18 @@ def main():
     except Exception as e:
         add_warning(warnings, f"Could not read existing OLS httpd config: {e}", source=str(ols_httpd))
         existing_httpd = ""
+
+    if existing_httpd:
+        external_vhosts = collect_external_vhost_names(existing_httpd, ols_vhosts_root=str(ols_vhosts_root))
+        conflicting = [s for s in sites if s.name in external_vhosts]
+        for s in conflicting:
+            add_warning(
+                warnings,
+                f"virtualhost '{s.name}' already exists in OLS outside the managed block — skipped to avoid conflict",
+                site=s.name,
+            )
+            TERM.warn(f"virtualhost '{s.name}' already exists in OLS outside managed block — skipped")
+        sites = [s for s in sites if s.name not in external_vhosts]
 
     TERM.info_kv("Patching OLS global httpd_config.conf")
     patched_httpd = patch_httpd_config(
