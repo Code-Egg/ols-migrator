@@ -74,25 +74,6 @@ python3 nginx_to_ols.py --use-nginx-user-group --apply -y
 python3 nginx_to_ols.py --use-nginx-user-group --only-public-sites --apply -y
 ```
 
-## Makefile
-
-A `Makefile` is included for convenience.
-
-| Target | Description |
-|---|---|
-| `make preview` | Dry-run preview (default) |
-| `make apply` | Apply migration to live OLS config |
-| `make apply-public` | Apply only public sites (ports 80/443), patch OLS user/group |
-| `make help` | Show script help |
-
-Pass `-q`/`-v` flags via make variables:
-
-```
-make preview q=1        # quiet
-make apply v=1          # verbose
-make apply-public q=1   # quiet apply
-```
-
 ## Notes
 
 - Without `--apply`, nothing is written to live OLS paths — only preview files are generated.
