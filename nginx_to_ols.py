@@ -29,6 +29,7 @@ LISTENER_MAP_BEGIN = "# BEGIN NGINX_TO_OLS MAPS"
 LISTENER_MAP_END = "# END NGINX_TO_OLS MAPS"
 GLOBAL_MANAGED_BEGIN = "# BEGIN NGINX_TO_OLS MANAGED"
 GLOBAL_MANAGED_END = "# END NGINX_TO_OLS MANAGED"
+VHCONF_MANAGED_MARKER = "# MANAGED_BY NGINX_TO_OLS"
 
 # ============================================================
 # Terminal / output helpers
@@ -1918,6 +1919,7 @@ def render_scripthandler(site: Site) -> str:
 def render_site_vhconf(site: Site, auto_htaccess: bool = True) -> str:
     parts = []
 
+    parts.append(f"{VHCONF_MANAGED_MARKER}\n")
     parts.append(f"docRoot                   {site.root}\n")
 
     if site.enable_expires:
@@ -2661,10 +2663,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="<dir>",
         help=f"preview output directory (default: {DEFAULT_OUTPUT})",
     )
-    p.add_argument(
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
         "--apply",
         action="store_true",
         help="write patched config to real OLS paths",
+    )
+    mode.add_argument(
+        "--revert",
+        action="store_true",
+        help="remove the managed block from OLS config and delete managed vhost dirs",
     )
     p.add_argument(
         "--disable-htaccess",
@@ -2722,6 +2730,77 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 # ============================================================
+# revert
+# ============================================================
+
+def do_revert(ols_httpd: Path, ols_vhosts_root: Path, yes: bool):
+    errors = []
+    if not ols_httpd.parent.is_dir():
+        errors.append(f"OLS config directory does not exist: {ols_httpd.parent}")
+    if not ols_vhosts_root.is_dir():
+        errors.append(f"OLS vhosts root does not exist: {ols_vhosts_root}")
+    if errors:
+        for msg in errors:
+            TERM.error(msg)
+        TERM.error("Is OpenLiteSpeed installed? Aborting --revert.")
+        sys.exit(1)
+
+    # --- Strip managed block from httpd_config.conf ---
+    if not ols_httpd.exists():
+        TERM.warn(f"OLS httpd config not found: {ols_httpd} — nothing to revert")
+    else:
+        httpd_text = slurp(ols_httpd)
+        span = find_global_managed_span(httpd_text)
+        if not span:
+            TERM.info("No managed block found in OLS httpd config — nothing to strip")
+        else:
+            reverted = httpd_text[:span[0]].rstrip() + "\n"
+            backup_file(ols_httpd)
+            spit(ols_httpd, reverted)
+            TERM.ok(f"Removed managed block from {ols_httpd}")
+
+    # --- Find managed vhost dirs ---
+    managed_dirs: List[Path] = []
+    for entry in sorted(ols_vhosts_root.iterdir()):
+        if not entry.is_dir():
+            continue
+        vhconf = entry / "vhconf.conf"
+        if not vhconf.exists():
+            continue
+        try:
+            first_line = vhconf.read_text(encoding="utf-8", errors="replace").split("\n", 1)[0].strip()
+        except Exception:
+            continue
+        if first_line == VHCONF_MANAGED_MARKER:
+            managed_dirs.append(entry)
+
+    if not managed_dirs:
+        TERM.info("No managed vhost dirs found — nothing to delete")
+    else:
+        TERM.info(f"Found {len(managed_dirs)} managed vhost dir(s) to delete:")
+        for d in managed_dirs:
+            print(f"  {d}")
+
+        if not yes:
+            try:
+                ans = input(TERM.colorize("Delete these vhost dirs? [y/N]: ", "yellow", bold=True)).strip().lower()
+            except EOFError:
+                ans = ""
+            if ans != "y":
+                TERM.error("Aborted — vhost dirs not deleted.")
+                sys.exit(1)
+
+        for d in managed_dirs:
+            shutil.rmtree(d)
+            TERM.ok(f"Deleted {d}")
+
+    # --- Restart OLS ---
+    if restart_lsws_if_active():
+        TERM.ok("OpenLiteSpeed restarted")
+    else:
+        TERM.info("OpenLiteSpeed is not running — no restart needed")
+
+# ============================================================
 # main
 # ============================================================
 
@@ -2740,6 +2819,10 @@ def main():
     ols_httpd = Path(args.ols_httpd)
     ols_vhosts_root = Path(args.ols_vhosts_root)
     output_dir = Path(args.output)
+
+    if args.revert:
+        do_revert(ols_httpd, ols_vhosts_root, yes=args.yes)
+        sys.exit(0)
 
     warnings: List[WarningEntry] = []
 
