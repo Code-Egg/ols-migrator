@@ -2765,6 +2765,12 @@ def main():
 
     TERM.ok("Preview generated successfully")
 
+    php_apps = sorted({s.php_app for s in sites if s.php_app})
+    for app in php_apps:
+        bin_path = f"/usr/local/lsws/{app}/bin/lsphp"
+        if not Path(bin_path).exists():
+            TERM.note(f"extprocessor '{app}' was created but {bin_path} not found — please install the package")
+
     if args.apply:
         restarted_ols = False
         if args.use_nginx_user_group:
