@@ -26,7 +26,7 @@ Single-file Python script to migrate nginx configuration to OpenLiteSpeed (OLS).
 | `--ols-httpd <path>` | `/usr/local/lsws/conf/httpd_config.conf` | Path to OLS global config file |
 | `--ols-vhosts-root <dir>` | `/usr/local/lsws/conf/vhosts` | OLS vhosts root directory |
 | `--output <dir>` | `ols_migration_conf_preview` | Directory to write preview output |
-| `--apply` | _(off)_ | Write patched config to real OLS paths |
+| `--apply` |  | Write patched config to real OLS paths |
 
 ### Advanced Options
 
