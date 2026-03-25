@@ -609,7 +609,7 @@ def expand_nodes(nodes: List[Node], current_file: Path, ctx: dict, stack: List[P
                     add_warning(ctx["warnings"], f"Include cycle detected, skipping: {inc}", source=str(current_file), line=node.line)
                     continue
                 TERM.debug(f"Expanding include: {pattern} -> {inc}")
-                out.extend(parse_nginx_file_expanded(inc, ctx, stack + [inc]))
+                out.extend(parse_nginx_file_expanded(inc, ctx, stack + [inc], is_include=True))
             continue
 
         new_children = expand_nodes(node.children, current_file, ctx, stack) if node.children else []
@@ -618,14 +618,18 @@ def expand_nodes(nodes: List[Node], current_file: Path, ctx: dict, stack: List[P
         out.append(new_node)
     return out
 
-def parse_nginx_file_expanded(path: Path, ctx: dict, stack: Optional[List[Path]] = None) -> List[Node]:
+def parse_nginx_file_expanded(path: Path, ctx: dict, stack: Optional[List[Path]] = None, is_include: bool = False) -> List[Node]:
     if stack is None:
         stack = [path.resolve()]
     real = path.resolve()
     if str(real) in ctx["parsed_files"]:
         TERM.debug(f"Skipping already-parsed nginx file: {real}")
         return []
-    ctx["parsed_files"].add(str(real))
+    # Only track top-level source files in parsed_files.
+    # Include files must NOT be added here — the same common/*.conf may be
+    # legitimately included by multiple vhost configs and must expand in each.
+    if not is_include:
+        ctx["parsed_files"].add(str(real))
     TERM.debug(f"Parsing nginx file: {real}")
     try:
         text = slurp(real)
