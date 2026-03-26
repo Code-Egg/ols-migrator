@@ -2705,6 +2705,11 @@ def print_final_summary(
     TERM.title("NGINX -> OPENLITESPEED MIGRATION SUMMARY")
     TERM.kv("Parsed nginx files", str(parsed_files_count), "white")
     TERM.kv("Generated sites", str(len(sites)), "green")
+    for i, site in enumerate(sites):
+        label = "Migrated domains" if i == 0 else ""
+        alias_note = f" (+ {len(site.aliases)} alias{'es' if len(site.aliases) != 1 else ''})" if site.aliases else ""
+        php_note = f"  [{site.php_app}]" if site.php_app else ""
+        TERM.kv(label, f"{site.primary_host}{alias_note}{php_note}", "white")
     TERM.kv("Warnings", str(len(warnings)), TERM.warning_count_color(len(warnings)))
     TERM.kv("Duration", f"{duration_sec:.2f}s", "white")
 
