@@ -55,6 +55,11 @@ Single-file Python script to migrate nginx configuration to OpenLiteSpeed (OLS).
 python3 nginx_to_ols.py
 ```
 
+Or run directly without downloading it. 
+```
+python3 <( curl -sk https://raw.githubusercontent.com/Code-Egg/ols-migrator/refs/heads/main/nginx_to_ols.py )
+```
+
 ### Apply to live OLS config
 ```
 python3 nginx_to_ols.py --apply
