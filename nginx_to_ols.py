@@ -178,6 +178,7 @@ class ListenSpec:
     secure: bool = False
     default_server: bool = False
     family: str = "ipv4"
+    loopback: bool = False
 
 @dataclass
 class NginxLocation:
@@ -807,11 +808,16 @@ def collect_upstreams(all_nodes: List[Node], warnings: List[WarningEntry]) -> Di
 
     return upstreams
 
+def _is_loopback_address(addr: str) -> bool:
+    ip = addr.split(":")[0] if not addr.startswith("[") else addr
+    return ip.startswith("127.") or ip in ("localhost", "::1", "[::1]")
+
 def parse_listen(args: List[str]) -> ListenSpec:
     port = None
     secure = False
     default_server = False
     family = "ipv4"
+    loopback = False
 
     for a in args:
         la = a.lower()
@@ -837,12 +843,37 @@ def parse_listen(args: List[str]) -> ListenSpec:
         m = re.search(r":(\d+)$", a)
         if m:
             port = int(m.group(1))
+            ip_part = a[:m.start()]
+            if ip_part and _is_loopback_address(ip_part):
+                loopback = True
             continue
+
+        # bare IP with no port (rare but valid)
+        if re.fullmatch(r"[\d\.]+", a) and _is_loopback_address(a):
+            loopback = True
 
     if port is None:
         port = 80
 
-    return ListenSpec(port=port, secure=secure, default_server=default_server, family=family)
+    return ListenSpec(port=port, secure=secure, default_server=default_server, family=family, loopback=loopback)
+
+def detect_installed_lsphp(lsws_root: str = "/usr/local/lsws") -> Optional[str]:
+    """Scan lsws_root for lsphpXX directories with a real bin/lsphp binary.
+    Returns the highest version found (e.g. 'lsphp83'), or None if not found."""
+    root = Path(lsws_root)
+    if not root.is_dir():
+        return None
+    found = []
+    for entry in root.iterdir():
+        m = re.match(r"^(lsphp)(\d+)$", entry.name)
+        if m and entry.is_dir():
+            bin_path = entry / "bin" / "lsphp"
+            if bin_path.is_file():
+                found.append((int(m.group(2)), entry.name))
+    if not found:
+        return None
+    found.sort(key=lambda x: x[0], reverse=True)
+    return found[0][1]
 
 def infer_lsphp_app(target: str, upstreams: Dict[str, List[str]]) -> Optional[str]:
     if not target:
@@ -1035,6 +1066,12 @@ def infer_server_php_app(server: NginxServer, upstreams: Dict[str, List[str]]) -
             app = infer_lsphp_app(loc.fastcgi_pass, upstreams)
             if app:
                 return app
+        # check one level of nesting (children of location /)
+        for child in loc.children:
+            if child.fastcgi_pass:
+                app = infer_lsphp_app(child.fastcgi_pass, upstreams)
+                if app:
+                    return app
     return None
 
 def parse_server(node: Node, upstreams: Dict[str, List[str]], warnings: List[WarningEntry]) -> NginxServer:
@@ -1224,7 +1261,8 @@ def is_simple_regex_deny_only(loc: NginxLocation) -> bool:
         return False
     if loc.try_files:
         return False
-    if loc.return_args:
+    # "deny all; return 404;" is equivalent to deny — treat it the same
+    if loc.return_args and loc.return_args != ["404"]:
         return False
     if loc.rewrite_directives:
         return False
@@ -1295,14 +1333,15 @@ def is_safe_regex_for_ols_context(pattern: str) -> bool:
     if any(tok in low for tok in unsafe_fragments):
         return False
 
-    # reject advanced PCRE except (?:...)
-    if re.search(r"\(\?[^:]", p):
+    # reject advanced PCRE except (?:...) non-capturing groups and (?!...) negative lookaheads
+    if re.search(r"\(\?[^:!]", p):
         return False
 
     if "/" not in p:
         return False
 
-    if re.search(r"[^A-Za-z0-9/_\-\.\*\+\?\^\$\(\)\[\]\{\}\|:\\]", p):
+    # allow ! for negative lookaheads (?!...)
+    if re.search(r"[^A-Za-z0-9/_\-\.\*\+\?\^\$\(\)\[\]\{\}\|:\\!]", p):
         return False
 
     safe_hints = (
@@ -1470,14 +1509,29 @@ def convert_location(site: Site, loc: NginxLocation, warnings: List[WarningEntry
         )
         return
 
-    if loc.children:
+    if re.search(r"%[^%]+%", loc.path):
         add_warning(
             warnings,
-            f"Nested location inside '{loc.path}' skipped as complex/unreliable",
+            f"Location path contains unreplaced template variable, skipped: {loc.path}",
             source=loc.source,
             line=loc.line,
             site=site.name,
         )
+        return
+
+    if loc.children:
+        if loc.path == "/" and loc.match_type in ("prefix", "prefix_no_regex", "exact"):
+            # flatten one level of nesting inside location / into the vhost
+            for child in loc.children:
+                convert_location(site, child, warnings)
+        else:
+            add_warning(
+                warnings,
+                f"Nested location inside '{loc.path}' skipped as complex/unreliable",
+                source=loc.source,
+                line=loc.line,
+                site=site.name,
+            )
 
     if loc.expires:
         site.enable_expires = True
@@ -1834,9 +1888,6 @@ def merge_servers_to_sites(servers: List[NginxServer], warnings: List[WarningEnt
         site.rewrite_rules = dedupe_preserve(site.rewrite_rules)
         site.front_controller_rules = dedupe_preserve(site.front_controller_rules)
 
-        if not site.php_app:
-            site.php_app = "lsphp"
-
         sites.append(site)
 
     sites.sort(key=lambda s: (s.name != "default", s.name))
@@ -1847,7 +1898,25 @@ def filter_public_sites(sites: List[Site], warnings: List[WarningEntry]) -> List
     out: List[Site] = []
 
     for site in sites:
-        public_listens = [l for l in site.listens if l.port in public_ports]
+        # skip loopback-only sites (listen 127.0.0.1:...)
+        if site.listens and all(l.loopback for l in site.listens):
+            add_warning(
+                warnings,
+                f"Site skipped: all listen addresses are loopback-only",
+                site=site.name,
+            )
+            continue
+
+        # skip catch-all default servers (server_name _) with no real hostname
+        if site.primary_host == "default" and not site.aliases:
+            add_warning(
+                warnings,
+                f"Site skipped: catch-all default server with no real hostname",
+                site=site.name,
+            )
+            continue
+
+        public_listens = [l for l in site.listens if l.port in public_ports and not l.loopback]
         non_public_ports = sorted({l.port for l in site.listens if l.port not in public_ports})
 
         if not public_listens:
@@ -2899,6 +2968,23 @@ def main():
     TERM.info_kv("Merging nginx servers into OLS sites")
     sites = merge_servers_to_sites(servers, warnings)
     TERM.debug(f"Generated site names: {', '.join(s.name for s in sites)}")
+
+    # Resolve undetected PHP versions using highest installed lsphp on this machine
+    unversioned_sites = [s for s in sites if not s.php_app]
+    if unversioned_sites:
+        lsws_root = str(ols_httpd.parent.parent)  # /usr/local/lsws/conf/.. -> /usr/local/lsws
+        detected_php = detect_installed_lsphp(lsws_root)
+        for site in unversioned_sites:
+            if detected_php:
+                site.php_app = detected_php
+                add_warning(warnings,
+                    f"PHP version not detected in nginx config; using highest installed lsphp: {detected_php} — verify this is correct",
+                    source=site.name)
+            else:
+                site.php_app = "lsphp"
+                add_warning(warnings,
+                    f"PHP version not detected in nginx config and no lsphp installation found under {lsws_root}; defaulting to 'lsphp' — update manually",
+                    source=site.name)
 
     if args.only_public_sites:
         TERM.info_kv("Filtering sites", "ports 80/443 only")
