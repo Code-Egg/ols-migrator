@@ -8,7 +8,7 @@ Single-file Python script to migrate nginx configuration to OpenLiteSpeed (OLS).
 - nginx config directory must exist (default: `/etc/nginx`)
 - OpenLiteSpeed must be installed before using `--apply`
 
-## What It Does
+## What it does
 
 - Parses nginx config from file or directory, including `nginx.conf`, `conf.d`, `sites-enabled`, and `sites-available`
 - Generates/patches OLS global config at `/usr/local/lsws/conf/httpd_config.conf`
@@ -18,7 +18,7 @@ Single-file Python script to migrate nginx configuration to OpenLiteSpeed (OLS).
 
 ## Options
 
-### Essential Options
+### Essential options
 
 | Option | Default | Description |
 |---|---|---|
@@ -28,7 +28,7 @@ Single-file Python script to migrate nginx configuration to OpenLiteSpeed (OLS).
 | `--output <dir>` | `ols_migration_conf_preview` | Directory to write preview output |
 | `--apply` |  | Write patched config to real OLS paths |
 
-### Advanced Options
+### Advanced options
 
 | Option | Description |
 |---|---|
@@ -37,7 +37,7 @@ Single-file Python script to migrate nginx configuration to OpenLiteSpeed (OLS).
 | `--use-nginx-user-group` | Patch global OLS user/group from nginx; on `--apply` also reinstalls OLS and restarts lsws |
 | `--disable-htaccess` | Disable `autoLoadHtaccess` in generated vhconf |
 
-### Control Options
+### Control options
 
 | Option | Description |
 |---|---|
